@@ -3,8 +3,16 @@
 import asyncio
 import heapq
 import time
+from enum import Enum
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+
+class RunState(Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    TERMINAL_SUCCESS = "terminal_success"
+    TERMINAL_FAILURE = "terminal_failure"
 
 
 class PriorityQueue:
@@ -33,15 +41,35 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._terminal_outcomes: Dict[str, str] = {}  # task_id -> terminal state
         self._max_retries = 3
 
+    def _is_terminal(self, task: Dict) -> bool:
+        """Check if task has reached a terminal state (success or failure)."""
+        state = task.get("run_state", RunState.PENDING.name)
+        return state in (RunState.TERMINAL_SUCCESS.name, RunState.TERMINAL_FAILURE.name)
+
+    def _set_terminal_outcome(self, task_id: str, outcome: str) -> None:
+        """Persist durable terminal outcome for a task."""
+        self._terminal_outcomes[task_id] = outcome
+
+    def _is_already_terminal(self, task_id: str) -> bool:
+        """Check if task already has a recorded terminal outcome."""
+        return task_id in self._terminal_outcomes
+
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+        # Guard: reject terminal tasks from being enqueued as fresh work
+        task_id = task.get("id")
+        if task_id and self._is_already_terminal(task_id):
+            return task_id
+
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["run_state"] = RunState.PENDING.name
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
@@ -51,16 +79,17 @@ class TaskScheduler:
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["run_state"] = RunState.PENDING.name
+        self._scheduled[task_id] = {"task": task, "due": time.time() + delay, "queue": queue, "priority": priority}
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [tid for tid, entry in self._scheduled.items() if entry["due"] <= now]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            entry = self._scheduled.pop(tid)
+            if entry["task"]:
+                self.enqueue(entry["task"], entry["queue"], entry["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -70,15 +99,24 @@ class TaskScheduler:
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task:
+            if not self._is_already_terminal(task_id):
+                self._set_terminal_outcome(task_id, RunState.TERMINAL_SUCCESS.value)
+            return True
+        return False
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+            task["run_state"] = RunState.IN_PROGRESS.name
+            if task["retries"] >= self._max_retries:
+                if not self._is_already_terminal(task_id):
+                    self._set_terminal_outcome(task_id, RunState.TERMINAL_FAILURE.value)
+                return False
+            self.enqueue(task, queue, priority=task.get("priority", 0))
+            return True
         return False
 
 # 2019-04-25T08:37:12 update

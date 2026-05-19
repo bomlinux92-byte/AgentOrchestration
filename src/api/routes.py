@@ -3,7 +3,8 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from src.agent import AgentRegistry
+from src.agent.registry import AgentStatus
 
 router = APIRouter()
 registry = AgentRegistry()

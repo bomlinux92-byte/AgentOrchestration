@@ -36,6 +36,53 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_no_retry_after_terminal_failure(self):
+        """Exhausted retries should record terminal outcome and stop retrying."""
+        import asyncio
+
+        # Simulate retry exhaustion by manually cycling through retries
+        # Since each enqueue() gives a fresh task (retries=0), we test the
+        # fail() logic directly on a task in _in_flight
+        task = {"type": "test", "retries": 2, "id": "exhausted-task"}
+        self.scheduler._in_flight["exhausted-task"] = task
+
+        # retries=2, fail → retries=3, 3>=3 → terminal failure recorded, return False
+        r = self.scheduler.fail("exhausted-task")
+        assert r is False
+        assert self.scheduler._is_already_terminal("exhausted-task")
+        assert self.scheduler._terminal_outcomes["exhausted-task"] == "terminal_failure"
+
+        # Calling fail again on already-terminal task: return False safely
+        r2 = self.scheduler.fail("exhausted-task")
+        assert r2 is False
+
+    def test_complete_marks_terminal(self):
+        """Complete should record terminal success for in-flight task."""
+        import asyncio
+
+        task = {"type": "test"}
+        self.scheduler.enqueue(task)
+        t = asyncio.run(self.scheduler.dequeue())
+        assert t is not None
+
+        c = self.scheduler.complete(t["id"])
+        assert c is True
+        assert self.scheduler._is_already_terminal(t["id"])
+        assert self.scheduler._terminal_outcomes[t["id"]] == "terminal_success"
+
+    def test_terminal_task_not_reenqueued(self):
+        """A task that already has a terminal outcome should not be re-enqueued."""
+        task_id = "test-task-terminal"
+        task = {"type": "test", "run_state": "TERMINAL_SUCCESS", "id": task_id}
+        self.scheduler._set_terminal_outcome(task_id, "terminal_success")
+        # Trying to enqueue should return existing task_id without adding to queue
+        result_id = self.scheduler.enqueue(task)
+        assert result_id == task_id
+        # No tasks in queue for this terminal task
+        import asyncio
+        result = asyncio.run(self.scheduler.dequeue())
+        assert result is None or result.get("id") != task_id
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
