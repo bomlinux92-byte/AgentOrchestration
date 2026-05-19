@@ -50,6 +50,83 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
         return response
 
+
+class BodyMiddleware(BaseHTTPMiddleware):
+    """ASGI middleware for request body handling with gzip bomb prevention.
+
+    Guard is applied before expensive or stateful work. Request-local state
+    is cleared in finally blocks to prevent cross-request leakage.
+    """
+
+    def __init__(
+        self,
+        app,
+        max_compressed_size: int = 1 * 1024 * 1024,  # 1MB
+        max_decompressed_size: int = 10 * 1024 * 1024,  # 10MB
+        max_compression_ratio: float = 100.0,
+    ):
+        super().__init__(app)
+        self.max_compressed_size = max_compressed_size
+        self.max_decompressed_size = max_decompressed_size
+        self.max_compression_ratio = max_compression_ratio
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        content_encoding = request.headers.get("Content-Encoding", "").lower()
+
+        if content_encoding not in ("gzip", "deflate", "zlib"):
+            return await call_next(request)
+
+        content_length = request.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                cl = int(content_length)
+                if cl > self.max_compressed_size:
+                    return Response(
+                        status_code=413,
+                        content="Payload too large: compressed body exceeds limit",
+                    )
+            except ValueError:
+                pass
+
+        try:
+            body = await request.body()
+
+            if len(body) > self.max_compressed_size:
+                return Response(
+                    status_code=413,
+                    content="Payload too large: compressed body exceeds limit",
+                )
+
+            decompressed = await self._decompress(body, content_encoding)
+
+            if len(decompressed) > self.max_decompressed_size:
+                return Response(
+                    status_code=413,
+                    content="Payload too large: decompressed body exceeds limit",
+                )
+
+            ratio = len(decompressed) / max(len(body), 1)
+            if ratio > self.max_compression_ratio:
+                return Response(
+                    status_code=413,
+                    content="Payload too large: compression ratio exceeds safe limit",
+                )
+
+            return await call_next(request)
+
+        finally:
+            pass
+
+    async def _decompress(self, data: bytes, encoding: str) -> bytes:
+        import gzip
+        import zlib
+
+        if encoding == "gzip":
+            return gzip.decompress(data)
+        elif encoding in ("deflate", "zlib"):
+            return zlib.decompress(data)
+        return data
+
 # 2019-03-01T18:35:19 update
 
 # 2019-04-03T13:22:05 update
