@@ -5,6 +5,14 @@ import sys
 
 from src.common.config import Config
 from src.common.logging import configure_logging
+from src.orchestrator.deployment import (
+    MultiArchManifestGate,
+    get_validation_gate,
+    validate_manifest_push,
+    ManifestValidationError,
+    ValidationStatus,
+    ScanStatus,
+)
 
 
 def cli():
@@ -27,6 +35,11 @@ def cli():
     logs_parser.add_argument("agent_id", help="Agent ID")
     logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
 
+    publish_parser = subparsers.add_parser("publish-manifest", help="Publish a multi-arch manifest")
+    publish_parser.add_argument("tag", help="Image tag to publish")
+    publish_parser.add_argument("--arch", action="append", dest="architectures",
+                                 help="Architecture to add (can be specified multiple times)")
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -42,6 +55,25 @@ def cli():
         print("Checking agent status...")
     elif args.command == "logs":
         print(f"Fetching logs for agent: {args.agent_id}")
+    elif args.command == "publish-manifest":
+        print(f"Publishing multi-arch manifest: {args.tag}")
+        if args.architectures:
+            gate = get_validation_gate()
+            gate.create_manifest(args.tag)
+            for arch in args.architectures:
+                print(f"  - Added architecture: {arch}")
+            try:
+                summary = validate_manifest_push(args.tag)
+                print(f"Manifest '{args.tag}' validated successfully:")
+                for arch, status in summary.get("architectures", {}).items():
+                    ready = "✓" if status.get("ready") else "✗"
+                    print(f"  [{ready}] {arch}: validation={status['validation_status']}, scan={status['scan_status']}, test={status['test_result']}")
+            except ManifestValidationError as e:
+                print(f"ERROR: {e.message}")
+                print(f"Missing architectures: {', '.join(e.missing_architectures)}")
+                sys.exit(1)
+        else:
+            print("No architectures specified. Use --arch amd64 --arch arm64")
     else:
         parser.print_help()
         sys.exit(1)
