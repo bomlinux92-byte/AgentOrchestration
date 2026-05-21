@@ -1,13 +1,110 @@
 """API middleware components."""
 
+import re
+import json
 import time
 import logging
-from typing import Callable
+from typing import Callable, List, Optional, Set
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
 logger = logging.getLogger(__name__)
+
+SENSITIVE_FIELD_PATTERNS = re.compile(
+    r"^(password|passwd|secret|token|api_?key|access_?key|private_?key|"
+    r"auth_?token|refresh_?token|session_?id|credit_?card|ssn|"
+    r"authorization|cookie|credential|connection_?string)",
+    re.IGNORECASE,
+)
+
+_SENSITIVE_VALUE_PATTERN = re.compile(
+    r"(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+",
+    re.IGNORECASE,
+)
+
+
+def sanitize_value(value, max_length: int = 200) -> str:
+    if isinstance(value, str):
+        return value[:max_length] if len(value) > max_length else value
+    return str(value)[:max_length]
+
+
+def sanitize_dict(data: dict, seen: Optional[Set[int]] = None) -> dict:
+    if seen is None:
+        seen = set()
+    obj_id = id(data)
+    if obj_id in seen:
+        return data
+    seen.add(obj_id)
+
+    sanitized = {}
+    for key, value in data.items():
+        if isinstance(key, str) and SENSITIVE_FIELD_PATTERNS.match(key):
+            sanitized[key] = "***REDACTED***"
+        elif isinstance(value, dict):
+            sanitized[key] = sanitize_dict(value, seen)
+        elif isinstance(value, list):
+            sanitized[key] = [
+                sanitize_dict(item, seen) if isinstance(item, dict) else sanitize_value(item)
+                for item in value
+            ]
+        else:
+            sanitized[key] = sanitize_value(value)
+    return sanitized
+
+
+def sanitize_exception_detail(exc: Exception, extra_sensitive: Optional[Set[str]] = None) -> dict:
+    raw_message = str(exc)
+    sanitized_message = _SENSITIVE_VALUE_PATTERN.sub(r"\1=***REDACTED***", raw_message)
+    detail: dict = {
+        "error": type(exc).__name__,
+        "message": sanitized_message,
+    }
+    all_sensitive = SENSITIVE_FIELD_PATTERNS
+    extra = extra_sensitive or set()
+    if hasattr(exc, "__dict__"):
+        for attr_name, attr_value in exc.__dict__.items():
+            if not attr_name.startswith("_"):
+                key_is_sensitive = (
+                    isinstance(attr_name, str)
+                    and (all_sensitive.match(attr_name) or attr_name in extra)
+                )
+                if key_is_sensitive:
+                    detail[attr_name] = "***REDACTED***"
+                elif isinstance(attr_value, dict):
+                    detail[attr_name] = sanitize_dict(attr_value)
+                else:
+                    detail[attr_name] = sanitize_value(attr_value)
+    return detail
+
+
+class ErrorMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, sensitive_fields: Optional[List[str]] = None):
+        super().__init__(app)
+        self._extra_sensitive = set(sensitive_fields or [])
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        request.state._error_middleware_context = True
+        try:
+            response = await call_next(request)
+            return response
+        except Exception as exc:
+            sanitized = sanitize_exception_detail(exc, extra_sensitive=self._extra_sensitive)
+            logger.error(
+                "Request error: %s %s -> %s",
+                request.method,
+                request.url.path,
+                sanitized["error"],
+                extra={"sanitized_detail": sanitized},
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": sanitized},
+            )
+        finally:
+            if hasattr(request.state, "_error_middleware_context"):
+                del request.state._error_middleware_context
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
