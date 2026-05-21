@@ -2,6 +2,7 @@
 
 import asyncio
 import heapq
+import random
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -31,55 +32,195 @@ class PriorityQueue:
 
 
 class TaskScheduler:
+    """
+    Priority-based task scheduler with bounded retries, jitter, and
+    idempotent state-machine guard.
+
+    Bug fixes for issue #1546:
+    - Retries use jitter (exponential backoff with random noise) instead of
+      immediate re-enqueue, preventing thundering-herd on transient failures.
+    - Scheduled tasks are persisted as (task_dict, deadline) pairs, not bare
+      timestamps, so expired entries carry the correct payload.
+    - A durable terminal-outcome set prevents duplicate completions from
+      orphaning work or overwriting newer state.
+    """
+
+    # Terminal outcomes — once a task reaches one of these states it must
+    # not be accepted as fresh work again.
+    TERMINAL_OUTCOMES: frozenset = frozenset({"completed", "failed", "cancelled"})
+
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        # Store (task_dict, deadline) pairs so expired entries carry payload.
+        self._scheduled: Dict[str, tuple] = {}
         self._in_flight: Dict[str, Dict] = {}
+        # Terminal outcomes are persisted here and checked before mutation.
+        self._outcome: Dict[str, str] = {}
         self._max_retries = 3
+        # Jitter configuration: base delay and max jitter fraction.
+        self._retry_base_delay = 0.5
+        self._jitter_fraction = 0.3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
+    def _jitter_delay(self, attempt: int) -> float:
+        """Compute an exponential-backoff delay with random jitter."""
+        base = self._retry_base_delay * (2 ** attempt)
+        jitter_range = base * self._jitter_fraction
+        return base + random.uniform(-jitter_range, jitter_range)
+
+    def _is_terminal(self, task_id: str) -> bool:
+        """Return True if the task has already reached a terminal outcome."""
+        return task_id in self._outcome
+
+    def _set_outcome(self, task_id: str, outcome: str) -> None:
+        """
+        Persist a terminal outcome for a task.
+
+        Prevents duplicate events (e.g. a second 'complete' call) from
+        overwriting a newer state or leaving orphaned locks.
+        """
+        if task_id in self._outcome:
+            # Already has an outcome — reject if it's a different one.
+            if self._outcome[task_id] != outcome:
+                raise ValueError(
+                    f"Task {task_id} already has outcome "
+                    f"'{self._outcome[task_id]}', cannot set '{outcome}'"
+                )
+            # Idempotent: same outcome is a no-op.
+            return
+        self._outcome[task_id] = outcome
+
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
+        task_id = task.get("id")
+        if task_id is None:
+            task_id = str(uuid4())
+            task["id"] = task_id
+        else:
+            # Idempotency guard: do not re-enqueue a task that already has
+            # a terminal outcome recorded.
+            if self._is_terminal(task_id):
+                return task_id
+
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["retries"] = task.get("retries", 0)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id")
+        if task_id is None:
+            task_id = str(uuid4())
+            task["id"] = task_id
+
+        if self._is_terminal(task_id):
+            return task_id
+
+        deadline = time.time() + delay
+        self._scheduled[task_id] = (task, deadline)
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        # Move expired scheduled tasks into the queue.
+        expired_ids = [tid for tid, (_, dl) in self._scheduled.items() if dl <= now]
+        for tid in expired_ids:
+            task_dict, _ = self._scheduled.pop(tid)
+            if task_dict and not self._is_terminal(tid):
+                self.enqueue(task_dict, queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
-                self._in_flight[task["id"]] = task
+                task_id = task["id"]
+                if self._is_terminal(task_id):
+                    # Do not hand out a task that has already concluded.
+                    return None
+                self._in_flight[task_id] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        """
+        Record task completion.  Idempotent — calling complete() twice with
+        the same task_id is a no-op on the second call.
+        """
+        if task_id not in self._in_flight:
+            return False
+        if self._is_terminal(task_id):
+            # Already concluded — reject state overwrite.
+            return False
+        self._set_outcome(task_id, "completed")
+        self._in_flight.pop(task_id, None)
+        return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
+        """
+        Record a transient failure and re-enqueue with bounded retry and
+        jitter if the retry budget remains.  Returns True when the task was
+        retried; False when it was dropped (no budget left or already
+        terminal).
+        """
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        if task is None:
+            return False
+        if self._is_terminal(task_id):
+            return False
+
+        task["retries"] = task.get("retries", 0) + 1
+        if task["retries"] >= self._max_retries:
+            # Exhausted budget — record terminal failure.
+            self._set_outcome(task_id, "failed")
+            return False
+
+        # Compute jittered delay and re-schedule instead of immediate enqueue.
+        delay = self._jitter_delay(task["retries"])
+        self.schedule(task, delay, queue, priority=task.get("priority", 0))
+        return True
+
+    def cancel(self, task_id: str) -> bool:
+        """
+        Cancel a task regardless of its current state (queued, scheduled,
+        or in-flight).  Idempotent — cancelling an already-cancelled or
+        completed task returns True without changing the existing outcome.
+        """
+        existing = self._outcome.get(task_id)
+        if existing is not None:
+            # Already concluded — idempotent, return True.
+            return True
+
+        self._set_outcome(task_id, "cancelled")
+
+        # Remove from all mutable state locations.
+        self._in_flight.pop(task_id, None)
+        self._scheduled.pop(task_id, None)
+        return True
+
+    def get_outcome(self, task_id: str) -> Optional[str]:
+        """Return the recorded terminal outcome for a task, or None."""
+        return self._outcome.get(task_id, None)
+
+    @property
+    def max_retries(self) -> int:
+        return self._max_retries
+
+    @max_retries.setter
+    def max_retries(self, value: int) -> None:
+        if value < 0:
+            raise ValueError("max_retries must be non-negative")
+        self._max_retries = value
+
 
 # 2019-04-25T08:37:12 update
 
@@ -214,3 +355,6 @@ class TaskScheduler:
 # 2026-03-18T14:43:07 update
 
 # 2026-04-13T11:43:19 update
+
+# 2026-05-21 update — issue #1546: bounded retry with jitter,
+#   scheduled task payload fix, terminal-outcome idempotency guard
