@@ -28,6 +28,32 @@ class OrchestratorClient:
         except HTTPError as e:
             return {"error": e.code, "message": e.reason}
 
+    def get_task_monitor(self, timeout: float = 30.0) -> Dict:
+        """
+        Long-poll for task updates.
+        
+        The API key is revalidated on each poll request, ensuring revoked keys
+        are immediately rejected even during long-polling.
+        
+        Args:
+            timeout: Maximum seconds to wait for updates (default 30s)
+            
+        Returns:
+            Task update data or status
+        """
+        url = f"{self.base_url}/api/v2/tasks/monitor?timeout={timeout}"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        req = Request(url, headers=headers, method="GET")
+
+        try:
+            with urlopen(req) as resp:
+                return json.loads(resp.read().decode())
+        except HTTPError as e:
+            return {"error": e.code, "message": e.reason}
+
     def register_agent(self, name: str, agent_type: str, config: Dict = None) -> Dict:
         return self._request("POST", "/agents", {
             "name": name,

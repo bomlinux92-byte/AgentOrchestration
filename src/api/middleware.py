@@ -5,18 +5,80 @@ import logging
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
+
+from src.common.auth import get_auth_service, KeyStatus
 
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Authentication middleware that validates API keys on EVERY request.
+    
+    CRITICAL: For long-polling endpoints, this validates the API key on each
+    poll request, not just at connection time. This ensures revoked/disabled/expired
+    keys are immediately rejected even during ongoing long-poll operations.
+    """
+    
+    # Paths that don't require authentication
+    EXEMPT_PATHS = {
+        "/api/v2/auth/token",
+        "/health",
+        "/api/docs",
+        "/api/redoc",
+    }
+    
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+        # Skip auth for exempt paths
+        if request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
+        
+        # Only authenticate /api/v2 routes
+        if not request.url.path.startswith("/api/v2"):
+            return await call_next(request)
+        
+        # Extract the Bearer token
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Unauthorized", "message": "Missing or invalid Authorization header"},
+            )
+        
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        
+        # Validate the API key on EVERY request (critical for long-polling)
+        auth_service = get_auth_service()
+        is_valid, status, key_info = auth_service.validate_key(token)
+        
+        if not is_valid:
+            error_messages = {
+                KeyStatus.ANONYMOUS: "Anonymous access denied",
+                KeyStatus.REVOKED: "API key has been revoked",
+                KeyStatus.DISABLED: "API key is disabled",
+                KeyStatus.EXPIRED: "API key has expired",
+                KeyStatus.INSUFFICIENT_SCOPE: f"Required scope missing: {key_info.get('required_scope') if key_info else 'unknown'}",
+            }
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": error_messages.get(status, "Authentication failed"),
+                    "key_status": status.value,
+                },
+            )
+        
+        # Attach validated key info to request state for downstream use
+        request.state.api_key_info = key_info
+        request.state.workspace_id = key_info.get("workspace_id") if key_info else None
+        
         return await call_next(request)
+
+
+# 2026-05-21T08:00:00 update - Issue #625 fix
+# Revalidate API keys on every request to prevent revoked keys from being
+# accepted during long-polling operations
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
