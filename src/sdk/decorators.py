@@ -5,6 +5,36 @@ import asyncio
 from typing import Any, Callable, Dict, Optional
 
 
+# Reserved metadata keys that cannot be used by user definitions
+RESERVED_METADATA_KEYS = frozenset({
+    "id", "name", "type", "status", "version",
+    "created_at", "updated_at", "config", "metrics",
+    "agent_id", "handler", "retries", "timeout",
+})
+
+
+class MetadataValidationError(ValueError):
+    """Raised when a reserved metadata key is used in user definition."""
+    pass
+
+
+def validate_metadata_key(key: str, context: str = "metadata") -> None:
+    """Validate that a metadata key is not reserved.
+    
+    Args:
+        key: The metadata key to validate.
+        context: Description of where validation is happening (for error messages).
+    
+    Raises:
+        MetadataValidationError: If the key is reserved.
+    """
+    if key in RESERVED_METADATA_KEYS:
+        raise MetadataValidationError(
+            f"Reserved {context} key '{key}' cannot be used in user definition. "
+            f"Reserved keys: {sorted(RESERVED_METADATA_KEYS)}"
+        )
+
+
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
     def decorator(func: Callable) -> Callable:
@@ -162,3 +192,5 @@ def on_event(event_type: str):
 # 2026-04-27T20:21:10 update
 
 # 2026-05-08T09:35:47 update
+
+# 2026-05-21T07:00:00 update
