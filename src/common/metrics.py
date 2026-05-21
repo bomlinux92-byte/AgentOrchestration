@@ -2,8 +2,53 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
 from threading import Lock
+from typing import Dict
+
+# Default maximum recent samples per histogram to bound memory usage
+DEFAULT_MAX_SAMPLES = 1000
+
+
+class BoundedHistogram:
+    """Histogram with bounded sample storage using count/sum/min/max and a rolling window."""
+
+    def __init__(self, max_samples: int = DEFAULT_MAX_SAMPLES):
+        self.max_samples = max_samples
+        self.count = 0
+        self.sum = 0.0
+        self.min = 0.0
+        self.max = 0.0
+        self._recent: list[float] = []
+        self._initialized = False
+
+    def record(self, value: float) -> None:
+        self.count += 1
+        self.sum += value
+        if not self._initialized:
+            self.min = value
+            self.max = value
+            self._initialized = True
+        else:
+            if value < self.min:
+                self.min = value
+            if value > self.max:
+                self.max = value
+        # Bounded rolling window for recent samples
+        if self.max_samples > 0:
+            self._recent.append(value)
+            if len(self._recent) > self.max_samples:
+                self._recent.pop(0)
+
+    def snapshot(self) -> Dict:
+        avg = self.sum / self.count if self.count > 0 else 0.0
+        return {
+            "count": self.count,
+            "sum": self.sum,
+            "avg": avg,
+            "min": self.min,
+            "max": self.max,
+            "samples": list(self._recent),
+        }
 
 
 class MetricsCollector:
@@ -11,7 +56,7 @@ class MetricsCollector:
         self._lock = Lock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
-        self._histograms: Dict[str, List[float]] = defaultdict(list)
+        self._histograms: Dict[str, BoundedHistogram] = defaultdict(BoundedHistogram)
         self._timers: Dict[str, float] = {}
 
     def increment(self, metric: str, value: int = 1) -> None:
@@ -24,7 +69,7 @@ class MetricsCollector:
 
     def observe(self, metric: str, value: float) -> None:
         with self._lock:
-            self._histograms[metric].append(value)
+            self._histograms[metric].record(value)
 
     def start_timer(self, metric: str) -> None:
         with self._lock:
@@ -43,8 +88,7 @@ class MetricsCollector:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {k: v.snapshot() for k, v in self._histograms.items()},
             }
 
 

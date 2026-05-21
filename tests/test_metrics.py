@@ -24,6 +24,38 @@ class TestMetricsCollector:
         assert snapshot["histograms"]["response.time"]["count"] == 2
         assert snapshot["histograms"]["response.time"]["avg"] == 1.0
 
+    def test_observe_bounded_histogram(self):
+        """Test that histogram samples are bounded to prevent memory leaks."""
+        from src.common.metrics import BoundedHistogram
+        h = BoundedHistogram(max_samples=5)
+        for i in range(20):
+            h.record(float(i))
+        # count/sum/min/max should be accurate for all 20 records
+        assert h.count == 20
+        assert h.sum == sum(range(20))
+        assert h.min == 0.0
+        assert h.max == 19.0
+        # recent samples should be bounded to last 5
+        snap = h.snapshot()
+        assert len(snap["samples"]) == 5
+        assert snap["samples"] == [15.0, 16.0, 17.0, 18.0, 19.0]
+
+    def test_observe_many_values_memory_bounded(self):
+        """Test that observing many values does not cause unbounded memory growth."""
+        m = MetricsCollector()
+        # Record 10000 values
+        for i in range(10000):
+            m.observe("large.histogram", float(i))
+        snap = m.snapshot()
+        hist_data = snap["histograms"]["large.histogram"]
+        # count/sum/min/max should reflect all 10000 observations
+        assert hist_data["count"] == 10000
+        assert hist_data["sum"] == sum(range(10000))
+        assert hist_data["min"] == 0.0
+        assert hist_data["max"] == 9999.0
+        # recent samples should be bounded to max_samples (1000 by default)
+        assert len(hist_data["samples"]) <= 1000
+
     def test_timer(self):
         self.metrics.start_timer("operation")
         import time
