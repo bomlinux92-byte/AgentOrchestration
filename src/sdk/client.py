@@ -10,15 +10,17 @@ from urllib.error import HTTPError
 class OrchestratorClient:
     def __init__(self, base_url: str = None, api_key: str = None):
         self.base_url = base_url or os.getenv("AO_API_URL", "https://api.agent-orchestrator.io")
-        self.api_key = api_key or os.getenv("AO_API_KEY", "")
+        self.api_key = api_key if api_key is not None else os.getenv("AO_API_KEY", "")
         self._session = None
 
     def _request(self, method: str, path: str, data: Dict = None) -> Dict:
         url = f"{self.base_url}/api/v2{path}"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        else:
+            # Documented policy: omit auth header when no api_key is configured
+            pass
         body = json.dumps(data).encode() if data else None
         req = Request(url, data=body, headers=headers, method=method)
 
