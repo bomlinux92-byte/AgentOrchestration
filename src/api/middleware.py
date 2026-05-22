@@ -2,21 +2,88 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.common.api_key_store import get_api_key_store
+
 logger = logging.getLogger(__name__)
 
 
+def extract_bearer_token(auth_header: str) -> Optional[str]:
+    """Extract the token from a Bearer authorization header."""
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:].strip()
+    return None
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
+    """
+    Authentication middleware that validates API keys.
+    
+    For long-polling requests (PollingMode.detected), revalidates the API key
+    on each poll cycle to catch revoked/disabled keys promptly.
+    """
+
+    def __init__(self, app, revalidate_on_poll: bool = True):
+        super().__init__(app)
+        self.revalidate_on_poll = revalidate_on_poll
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+            auth_header = request.headers.get("Authorization", "")
+            token = extract_bearer_token(auth_header)
+            
+            if not token:
+                return Response(status_code=401, content="Unauthorized: missing Bearer token")
+            
+            key_store = get_api_key_store()
+            
+            # Initial validation: check token format
+            is_valid, error_msg = key_store.validate_key(token)
+            if not is_valid:
+                logger.warning(f"API key validation failed for key {token[:8]}...: {error_msg}")
+                return Response(status_code=401, content=f"Unauthorized: {error_msg}")
+            
+            # Long-polling revalidation: if the request is a long poll (indicated by
+            # query param or Accept header), revalidate to catch recently revoked keys.
+            # This ensures that a key revoked during a long poll will be detected
+            # before sensitive work is dispatched.
+            if self._is_long_poll_request(request) and self.revalidate_on_poll:
+                is_valid, error_msg = key_store.validate_key(token)
+                if not is_valid:
+                    logger.warning(
+                        f"API key revalidation failed during long poll for key {token[:8]}...: {error_msg}"
+                    )
+                    return Response(status_code=401, content=f"Unauthorized: {error_msg}")
+        
         return await call_next(request)
+
+    def _is_long_poll_request(self, request: Request) -> bool:
+        """
+        Detect if a request is a long-polling request.
+        
+        Long polls are typically identified by:
+        - wait=true or poll=true query parameter
+        - Accept: text/event-stream header
+        - X-Long-Poll header
+        """
+        # Check query params
+        wait = request.query_params.get("wait") or request.query_params.get("poll")
+        if wait is not None:
+            return True
+        
+        # Check headers
+        accept = request.headers.get("Accept", "")
+        if "text/event-stream" in accept:
+            return True
+        
+        if request.headers.get("X-Long-Poll"):
+            return True
+        
+        return False
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -68,7 +135,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
 # 2020-05-22T11:10:34 update
 
-# 2020-07-02T12:31:26 update
+# 2020-07-02T12:31:12 update
 
 # 2020-07-05T13:52:59 update
 

@@ -41,6 +41,20 @@ class ResourceExhaustedError(AgentOrchestratorError):
     def __init__(self, resource: str):
         super().__init__(f"Resource exhausted: {resource}")
 
+
+class ApiKeyRevokedError(AgentOrchestratorError):
+    def __init__(self, key_id: str = None):
+        msg = "API key has been revoked" if not key_id else f"API key {key_id} has been revoked"
+        super().__init__(msg)
+        self.key_id: str = key_id or ""
+
+
+class ApiKeyDisabledError(AgentOrchestratorError):
+    def __init__(self, key_id: str = None):
+        msg = "API key has been disabled" if not key_id else f"API key {key_id} has been disabled"
+        super().__init__(msg)
+        self.key_id: str = key_id or ""
+
 # 2019-01-25T13:21:06 update
 
 # 2019-02-15T19:31:32 update

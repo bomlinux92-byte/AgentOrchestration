@@ -1,0 +1,26 @@
+## Summary
+Fix for [BOUNTY $4k] [Middleware] Sanitize exception detail before JSON serialization — error middleware — Issue #1618
+
+## Root cause
+The ASGI middleware stack lacked an `ErrorMiddleware` that:
+1. Catches unhandled exceptions from all downstream handlers/routes
+2. Sanitizes sensitive fields (password, token, api_key, etc.) from exception messages and attributes
+3. Cleans up request-local state in a `finally` block to prevent cross-request leakage
+4. Returns a deterministic 5xx JSON response without exposing sensitive data
+
+## Fix
+Added `ErrorMiddleware` class to `src/api/middleware.py` with:
+- `sanitize_value()`: truncates values to max 200 chars
+- `sanitize_dict()`: recursively sanitizes dicts, redacting sensitive field keys (matched via regex patterns for password, token, api_key, secret, connection_string, etc.)
+- `sanitize_exception_detail()`: sanitizes exception messages (regex substitution) and all public exception attributes
+- `ErrorMiddleware.dispatch()`: catches exceptions, sanitizes detail, logs with sanitized data, returns JSON error response, cleans up in finally block
+- Integrated into `create_app()` in `src/api/server.py` with `app.add_middleware(ErrorMiddleware)`
+
+## Testing
+- 19 tests in `tests/test_error_middleware.py` covering:
+  - Unit tests for sanitize helpers (value, dict, exception detail, sensitive patterns)
+  - Integration tests for normal requests, auth rejection, error catching, attribute sanitization, custom sensitive fields, request state cleanup, cross-request isolation
+
+All 19 tests pass.
+
+Closes #1618
