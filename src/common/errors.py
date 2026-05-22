@@ -31,6 +31,12 @@ class AuthenticationError(AgentOrchestratorError):
         super().__init__(message)
 
 
+class AuthorizationError(AgentOrchestratorError):
+    """Raised when a principal lacks permission for an action."""
+    def __init__(self, message: str = "Permission denied"):
+        super().__init__(message)
+
+
 class RateLimitError(AgentOrchestratorError):
     def __init__(self, retry_after: int = 60):
         super().__init__(f"Rate limit exceeded. Retry after {retry_after}s")
