@@ -1,5 +1,6 @@
 import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
+from src.common.errors import VersionCompatibilityError
 
 
 class TestAgentRegistry:
@@ -47,6 +48,121 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+
+class TestVersionCompatibility:
+    """Regression tests for plugin upgrade version validation (issue #2494)."""
+
+    def setup_method(self):
+        self.registry = AgentRegistry()
+
+    def test_register_with_explicit_version(self):
+        agent_id = self.registry.register("v2-agent", "worker.processor", version="1.2.0")
+        agent = self.registry.get(agent_id)
+        assert agent["version"] == "1.2.0"
+
+    def test_register_rejects_incompatible_major(self):
+        with pytest.raises(VersionCompatibilityError):
+            self.registry.register("bad-agent", "worker.processor", version="2.0.0")
+
+    def test_register_rejects_old_version(self):
+        self.registry.set_min_version("1.3.0")
+        with pytest.raises(VersionCompatibilityError):
+            self.registry.register("old-agent", "worker.processor", version="1.2.0")
+
+    def test_resolve_returns_compatible_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor", version="1.1.0")
+        result = self.registry.resolve(agent_id, required_version="1.0.0")
+        assert result is not None
+        assert result["id"] == agent_id
+
+    def test_resolve_rejects_version_mismatch(self):
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        result = self.registry.resolve(agent_id, required_version="1.2.0")
+        assert result is None
+
+    def test_resolve_rejects_stopped_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert self.registry.resolve(agent_id) is None
+
+    def test_resolve_rejects_terminated_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+        assert self.registry.resolve(agent_id) is None
+
+    def test_resolve_rejects_failed_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.FAILED)
+        assert self.registry.resolve(agent_id) is None
+
+    def test_resolve_unknown_handler_returns_none(self):
+        assert self.registry.resolve("nonexistent", required_version="1.0.0") is None
+
+    def test_upgrade_handler_succeeds(self):
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert self.registry.upgrade_handler(agent_id, "1.1.0") is True
+        agent = self.registry.get(agent_id)
+        assert agent["version"] == "1.1.0"
+
+    def test_upgrade_rejects_active_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.upgrade_handler(agent_id, "1.1.0") is False
+        agent = self.registry.get(agent_id)
+        assert agent["version"] == "1.0.0"
+
+    def test_upgrade_rejects_duplicate_version(self):
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert self.registry.upgrade_handler(agent_id, "1.0.0") is False
+
+    def test_upgrade_rejects_incompatible_version(self):
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        with pytest.raises(VersionCompatibilityError):
+            self.registry.upgrade_handler(agent_id, "2.0.0")
+
+    def test_upgrade_unknown_handler_returns_false(self):
+        assert self.registry.upgrade_handler("nonexistent", "1.1.0") is False
+
+    def test_plugin_upgrade_during_lifecycle_transition(self):
+        """Deterministic regression: upgrade deferred while handler is running."""
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert self.registry.upgrade_handler(agent_id, "1.2.0") is False
+        agent = self.registry.get(agent_id)
+        assert agent["version"] == "1.0.0"
+        assert agent["status"] == "running"
+
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert self.registry.upgrade_handler(agent_id, "1.2.0") is True
+        agent = self.registry.get(agent_id)
+        assert agent["version"] == "1.2.0"
+
+    def test_cache_invalidated_after_upgrade(self):
+        """Version index stays consistent after an upgrade."""
+        agent_id = self.registry.register("handler", "worker.processor", version="1.0.0")
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        self.registry.upgrade_handler(agent_id, "1.3.0")
+        assert self.registry._version_index[agent_id] == "1.3.0"
+
+    def test_cache_cleaned_on_delete(self):
+        agent_id = self.registry.register("handler", "worker.processor")
+        assert agent_id in self.registry._version_index
+        self.registry.delete(agent_id)
+        assert agent_id not in self.registry._version_index
+
+    def test_resolve_allows_running_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve(agent_id) is not None
+
+    def test_resolve_allows_pending_handler(self):
+        agent_id = self.registry.register("handler", "worker.processor")
+        assert self.registry.resolve(agent_id) is not None
 
 # 2019-01-23T10:28:57 update
 
