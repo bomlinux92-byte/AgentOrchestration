@@ -50,6 +50,25 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
         return response
 
+
+class RequestSizeMiddleware(BaseHTTPMiddleware):
+    """Enforces maximum request body size BEFORE any lookup or mutation."""
+
+    def __init__(self, app, max_body_size: int = 10 * 1024 * 1024):
+        super().__init__(app)
+        self.max_body_size = max_body_size
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        if request.method in ("POST", "PUT", "PATCH"):
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                if int(content_length) > self.max_body_size:
+                    return Response(
+                        status_code=413,
+                        content="Request body too large",
+                    )
+        return await call_next(request)
+
 # 2019-03-01T18:35:19 update
 
 # 2019-04-03T13:22:05 update
