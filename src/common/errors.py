@@ -31,6 +31,24 @@ class AuthenticationError(AgentOrchestratorError):
         super().__init__(message)
 
 
+class AuthorizationError(AgentOrchestratorError):
+    """Raised when a principal lacks permission for an action."""
+    def __init__(self, message: str = "Permission denied"):
+        super().__init__(message)
+
+
+class VersionCompatibilityError(AgentOrchestratorError):
+    """Raised when a handler version is incompatible with the registry policy."""
+    def __init__(self, handler_id: str, current_version: str, required_version: str):
+        super().__init__(
+            f"Handler {handler_id} version {current_version} is incompatible "
+            f"with required version {required_version}"
+        )
+        self.handler_id = handler_id
+        self.current_version = current_version
+        self.required_version = required_version
+
+
 class RateLimitError(AgentOrchestratorError):
     def __init__(self, retry_after: int = 60):
         super().__init__(f"Rate limit exceeded. Retry after {retry_after}s")

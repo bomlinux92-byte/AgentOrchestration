@@ -1,10 +1,33 @@
-"""Agent Registry — Manages agent lifecycle and metadata."""
+"""Agent Registry — Manages agent lifecycle and metadata with version compatibility enforcement."""
 
-import json
+import logging
+import re
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.common.errors import VersionCompatibilityError
+
+logger = logging.getLogger(__name__)
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def _parse_version(version: str) -> Tuple[int, int, int]:
+    m = _VERSION_RE.match(version)
+    if not m:
+        raise ValueError(f"Invalid semantic version: {version}")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _is_compatible(current: str, required: str) -> bool:
+    """Return True if *current* >= *required* (semver major must match)."""
+    cur = _parse_version(current)
+    req = _parse_version(required)
+    if cur[0] != req[0]:
+        return False
+    return cur >= req
 
 
 class AgentStatus(Enum):
@@ -21,8 +44,23 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._version_index: Dict[str, str] = {}
+        self._min_version: str = "1.0.0"
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+        version: str = "1.0.0",
+    ) -> str:
+        if not _is_compatible(version, self._min_version):
+            logger.info(
+                "registration_rejected",
+                extra={"name": name, "version": version, "min_version": self._min_version},
+            )
+            raise VersionCompatibilityError(name, version, self._min_version)
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -33,17 +71,46 @@ class AgentRegistry:
             "config": config or {},
             "created_at": timestamp,
             "updated_at": timestamp,
-            "version": "1.0.0",
+            "version": version,
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
+        self._version_index[agent_id] = version
+
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+
+        logger.info(
+            "handler_registered",
+            extra={"agent_id": agent_id, "version": version},
+        )
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
+
+    def resolve(self, agent_id: str, required_version: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            logger.info("resolve_miss", extra={"agent_id": agent_id})
+            return None
+
+        if required_version and not _is_compatible(agent["version"], required_version):
+            logger.info(
+                "resolve_version_mismatch",
+                extra={"agent_id": agent_id, "version": agent["version"], "required": required_version},
+            )
+            return None
+
+        if agent["status"] in (AgentStatus.STOPPED.value, AgentStatus.TERMINATED.value, AgentStatus.FAILED.value):
+            logger.info(
+                "resolve_unavailable",
+                extra={"agent_id": agent_id, "status": agent["status"]},
+            )
+            return None
+
+        return agent
 
     def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
         agents = self._agents.values()
@@ -61,10 +128,58 @@ class AgentRegistry:
         self._agents[agent_id]["updated_at"] = time.time()
         return True
 
+    def upgrade_handler(self, agent_id: str, new_version: str) -> bool:
+        """Upgrade a handler to a new plugin version with compatibility validation.
+
+        Rejects the upgrade if the handler is mid-lifecycle transition, the new
+        version is incompatible, or a duplicate version is supplied.
+        Invalidates any cached version index entries on success.
+        """
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            logger.info("upgrade_unknown", extra={"agent_id": agent_id})
+            return False
+
+        current_version = agent["version"]
+
+        if current_version == new_version:
+            logger.info(
+                "upgrade_duplicate",
+                extra={"agent_id": agent_id, "version": new_version},
+            )
+            return False
+
+        if not _is_compatible(new_version, self._min_version):
+            logger.info(
+                "upgrade_incompatible",
+                extra={"agent_id": agent_id, "new_version": new_version, "min_version": self._min_version},
+            )
+            raise VersionCompatibilityError(agent_id, new_version, self._min_version)
+
+        active_statuses = {AgentStatus.RUNNING.value, AgentStatus.PENDING.value, AgentStatus.PAUSED.value}
+        if agent["status"] in active_statuses:
+            logger.info(
+                "upgrade_deferred",
+                extra={"agent_id": agent_id, "status": agent["status"], "new_version": new_version},
+            )
+            return False
+
+        old_version = agent["version"]
+        agent["version"] = new_version
+        agent["updated_at"] = time.time()
+        self._version_index[agent_id] = new_version
+
+        logger.info(
+            "handler_upgraded",
+            extra={"agent_id": agent_id, "old_version": old_version, "new_version": new_version},
+        )
+        return True
+
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
             return False
         agent = self._agents.pop(agent_id)
+        self._version_index.pop(agent_id, None)
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
@@ -72,6 +187,16 @@ class AgentRegistry:
 
     def count(self) -> int:
         return len(self._agents)
+
+    def set_min_version(self, version: str) -> None:
+        """Update the minimum compatible version and invalidate stale registrations."""
+        _parse_version(version)
+        old_min = self._min_version
+        self._min_version = version
+        logger.info(
+            "min_version_updated",
+            extra={"old_min": old_min, "new_min": version},
+        )
 
 # 2019-01-29T11:24:49 update
 
