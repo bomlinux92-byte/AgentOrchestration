@@ -2,7 +2,16 @@
 
 import os
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+
+# Allowlist of AO_ environment variable prefixes that are valid config overrides.
+# AO_AGENT_ID, AO_API_KEY, and AO_API_URL are runtime values that should NOT
+# leak into config snapshots. Only intentionally documented override keys are allowed.
+ALLOWED_ENV_PREFIXES: List[str] = [
+    "AO_API_KEY",
+    "AO_API_URL",
+]
 
 
 class Config:
@@ -17,10 +26,9 @@ class Config:
             self._data = json.load(f)
 
     def _load_env_overrides(self) -> None:
-        prefix = "AO_"
         for key, value in os.environ.items():
-            if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
+            if any(key.startswith(prefix) for prefix in ALLOWED_ENV_PREFIXES):
+                config_key = key[len("AO_"):].lower().replace("_", ".")
                 self._set_nested(config_key, value)
 
     def _set_nested(self, key: str, value: Any) -> None:

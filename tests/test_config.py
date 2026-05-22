@@ -32,6 +32,24 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_env_override_allowlist_blocks_runtime_vars(self, monkeypatch):
+        """Runtime-only AO_ variables like AO_AGENT_ID must NOT leak into config."""
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-123")
+        monkeypatch.setenv("AO_API_URL", "https://allowed.example.com")
+        monkeypatch.setenv("AO_UNRELATED_VAR", "should-not-appear")
+        config = Config()
+        # AO_AGENT_ID and AO_UNRELATED_VAR must not be imported
+        assert config.get("agent.id") is None
+        assert config.get("unrelated.var") is None
+        # Only explicitly allowlisted vars should be imported
+        assert config.get("api.url") == "https://allowed.example.com"
+
+    def test_env_override_allowlist_preserves_existing_behavior(self, monkeypatch):
+        """Only allowlisted AO_ prefixes are imported; all others are ignored."""
+        monkeypatch.setenv("AO_API_KEY", "secret-key")
+        config = Config()
+        assert config.get("api.key") == "secret-key"
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
