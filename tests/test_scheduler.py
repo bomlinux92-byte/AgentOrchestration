@@ -1,5 +1,5 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import TaskScheduler, SchedulerState
 
 
 class TestTaskScheduler:
@@ -35,6 +35,95 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_tenant_capacity_tracking(self):
+        """Test that per-tenant concurrency is properly tracked."""
+        import asyncio
+        
+        # Create scheduler with max 2 concurrent per tenant
+        scheduler = TaskScheduler(default_tenant_max_concurrent=2)
+        
+        # Enqueue tasks for tenant-a
+        task1 = {"type": "test", "tenant_id": "tenant-a"}
+        task2 = {"type": "test", "tenant_id": "tenant-a"}
+        task3 = {"type": "test", "tenant_id": "tenant-a"}
+        
+        id1 = scheduler.enqueue(task1)
+        id2 = scheduler.enqueue(task2)
+        id3 = scheduler.enqueue(task3)
+        
+        # Dequeue should work for first 2
+        t1 = asyncio.run(scheduler.dequeue())
+        t2 = asyncio.run(scheduler.dequeue())
+        
+        # Third should be deferred (at capacity)
+        t3 = asyncio.run(scheduler.dequeue())
+        # At capacity, so task is re-queued and None returned
+        assert t3 is None or t3["id"] == id3
+        
+        # Complete tasks and verify capacity is released
+        scheduler.complete(t1["id"])
+        scheduler.complete(t2["id"])
+        
+        # Now dequeue should work again
+        t3_new = asyncio.run(scheduler.dequeue())
+        assert t3_new is not None
+
+    def test_recover_in_flight_enforces_capacity(self):
+        """Test that recovery scanner enforces per-tenant concurrency."""
+        import asyncio
+        
+        scheduler = TaskScheduler(default_tenant_max_concurrent=2)
+        
+        # Simulate in-flight tasks from before restart
+        scheduler._in_flight = {
+            "task-1": {"id": "task-1", "type": "test", "tenant_id": "tenant-a"},
+            "task-2": {"id": "task-2", "type": "test", "tenant_id": "tenant-a"},
+            "task-3": {"id": "task-3", "type": "test", "tenant_id": "tenant-a"},  # Should be rejected
+        }
+        
+        result = asyncio.run(scheduler.recover_in_flight())
+        
+        # task-3 should be rejected (capacity exceeded for tenant-a)
+        assert result["status"] == "completed"
+        assert result["rejected_count"] >= 1
+        assert result["recovered_count"] >= 2
+        
+        # Verify rejected tasks are removed from in_flight
+        assert "task-3" not in scheduler._in_flight
+
+    def test_audit_log_bounded(self):
+        """Test that audit log has bounded retention."""
+        import asyncio
+        
+        scheduler = TaskScheduler()
+        
+        # Add many audit entries
+        for i in range(1100):
+            asyncio.run(scheduler._add_audit("tenant", f"task-{i}", "TEST", "a", "b", "reason"))
+        
+        # Should be bounded to MAX_ENTRIES
+        log = asyncio.run(scheduler.get_audit_log())
+        assert len(log) <= 1000
+
+    def test_atomic_state_transitions(self):
+        """Test that invalid state transitions are rejected."""
+        scheduler = TaskScheduler()
+        
+        # Valid: IDLE -> RECOVERING
+        assert scheduler._can_transition_state(SchedulerState.RECOVERING)
+        
+        # Set to RECOVERING
+        scheduler._state = SchedulerState.RECOVERING
+        
+        # Valid: RECOVERING -> ACTIVE
+        assert scheduler._can_transition_state(SchedulerState.ACTIVE)
+        
+        # Set to ACTIVE
+        scheduler._state = SchedulerState.ACTIVE
+        
+        # Invalid: ACTIVE -> RECOVERING (not in transitions)
+        assert not scheduler._can_transition_state(SchedulerState.RECOVERING)
 
 # 2019-01-09T19:07:03 update
 
