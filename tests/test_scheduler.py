@@ -1,5 +1,7 @@
+import asyncio
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+import time
+from src.orchestrator.scheduler import TaskScheduler, TaskState
 
 
 class TestTaskScheduler:
@@ -102,6 +104,80 @@ class TestTaskScheduler:
         assert self.scheduler.complete(task["id"]) is False
         failed_entries = self.scheduler.audit_log.get_entries(task["id"])
         assert any(e["event"] == "task_complete_failed" for e in failed_entries)
+
+    def test_state_transition_queued_to_in_flight(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        assert self.scheduler._task_states[task_id] == TaskState.QUEUED
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert self.scheduler._task_states[task["id"]] == TaskState.IN_FLIGHT
+
+    def test_state_transition_in_flight_to_completed(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(task["id"])
+        assert self.scheduler._task_states[task["id"]] == TaskState.COMPLETED
+
+    def test_state_transition_in_flight_to_failed_after_max_retries(self):
+        scheduler = TaskScheduler()
+        scheduler._max_retries = 1
+        scheduler.enqueue({"type": "test"})
+        task = asyncio.run(scheduler.dequeue())
+        scheduler.fail(task["id"])
+        assert scheduler._task_states[task["id"]] == TaskState.FAILED
+
+    def test_double_complete_rejected(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(task["id"]) is True
+        assert self.scheduler.complete(task["id"]) is False
+
+    def test_complete_unknown_task_rejected(self):
+        assert self.scheduler.complete("nonexistent") is False
+
+    def test_fail_unknown_task_rejected(self):
+        assert self.scheduler.fail("nonexistent") is False
+
+    def test_reclaim_stale_tasks(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        assert len(self.scheduler._in_flight) == 1
+        reclaimed = self.scheduler.reclaim_stale(max_age_seconds=0.0)
+        assert reclaimed == 1
+        assert len(self.scheduler._in_flight) == 0
+        assert self.scheduler._task_states[task_id] == TaskState.FAILED
+
+    def test_reclaim_does_not_affect_fresh_tasks(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        reclaimed = self.scheduler.reclaim_stale(max_age_seconds=3600.0)
+        assert reclaimed == 0
+        assert len(self.scheduler._in_flight) == 1
+
+    def test_retry_is_bounded(self):
+        scheduler = TaskScheduler()
+        scheduler._max_retries = 2
+        scheduler.enqueue({"type": "test"})
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.fail(task["id"]) is True
+        task2 = asyncio.run(scheduler.dequeue())
+        assert task2 is not None
+
+        assert scheduler.fail(task2["id"]) is False
+        assert scheduler._task_states[task2["id"]] == TaskState.FAILED
+
+    def test_fail_and_requeue_cycles_through_states(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler._task_states[task["id"]] == TaskState.IN_FLIGHT
+
+        self.scheduler.fail(task["id"])
+        assert self.scheduler._task_states[task["id"]] == TaskState.QUEUED
+
+        task2 = asyncio.run(self.scheduler.dequeue())
+        assert task2 is not None
+        assert self.scheduler._task_states[task2["id"]] == TaskState.IN_FLIGHT
 
 # 2019-01-09T19:07:03 update
 

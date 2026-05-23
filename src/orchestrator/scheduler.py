@@ -3,8 +3,26 @@
 import asyncio
 import heapq
 import time
+from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+logger = __import__("logging").getLogger(__name__)
+
+
+class TaskState(Enum):
+    QUEUED = "queued"
+    IN_FLIGHT = "in_flight"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+_VALID_TRANSITIONS = {
+    TaskState.QUEUED: {TaskState.IN_FLIGHT},
+    TaskState.IN_FLIGHT: {TaskState.COMPLETED, TaskState.FAILED, TaskState.QUEUED},
+    TaskState.COMPLETED: set(),
+    TaskState.FAILED: set(),
+}
 
 
 class SchedulerAuditLog:
@@ -59,6 +77,7 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._task_states: Dict[str, TaskState] = {}
         self._max_retries = 3
         self._audit = SchedulerAuditLog()
         self._lock = asyncio.Lock()
@@ -67,6 +86,29 @@ class TaskScheduler:
     def audit_log(self) -> SchedulerAuditLog:
         """Expose audit log for external access."""
         return self._audit
+
+    def _transition(self, task_id: str, new_state: TaskState) -> bool:
+        current = self._task_states.get(task_id)
+        if current is None:
+            self._audit.record(
+                "transition_rejected",
+                task_id,
+                {"reason": "unknown_task", "attempted": new_state.value},
+            )
+            return False
+        if new_state not in _VALID_TRANSITIONS.get(current, set()):
+            self._audit.record(
+                "transition_rejected",
+                task_id,
+                {
+                    "reason": "invalid_transition",
+                    "from": current.value,
+                    "attempted": new_state.value,
+                },
+            )
+            return False
+        self._task_states[task_id] = new_state
+        return True
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -77,12 +119,14 @@ class TaskScheduler:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
+        self._task_states[task_id] = TaskState.QUEUED
         return task_id
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
+        self._task_states[task_id] = TaskState.QUEUED
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
@@ -101,6 +145,13 @@ class TaskScheduler:
             if queue in self._queues and len(self._queues[queue]) > 0:
                 task = self._queues[queue].pop()
                 if task:
+                    if not self._transition(task["id"], TaskState.IN_FLIGHT):
+                        self._audit.record(
+                            "dequeue_rejected",
+                            task["id"],
+                            {"reason": "invalid_state"},
+                        )
+                        return None
                     self._in_flight[task["id"]] = task
                     self._audit.record(
                         "dequeue_allowed",
@@ -125,6 +176,15 @@ class TaskScheduler:
         return None
 
     def complete(self, task_id: str) -> bool:
+        if not self._transition(task_id, TaskState.COMPLETED):
+            current = self._task_states.get(task_id)
+            if current == TaskState.COMPLETED:
+                self._audit.record(
+                    "task_complete_failed",
+                    task_id,
+                    {"reason": "already_completed"},
+                )
+            return False
         task = self._in_flight.pop(task_id, None)
         if task:
             self._audit.record(
@@ -142,27 +202,62 @@ class TaskScheduler:
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
+        if not task:
             self._audit.record(
-                "task_failed",
+                "task_fail_failed",
                 task_id,
-                {"retries": task["retries"], "max_retries": self._max_retries},
+                {"reason": "not_in_flight"},
             )
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+            return False
+
+        task["retries"] += 1
+        self._audit.record(
+            "task_failed",
+            task_id,
+            {"retries": task["retries"], "max_retries": self._max_retries},
+        )
+        if task["retries"] < self._max_retries:
+            if not self._transition(task_id, TaskState.QUEUED):
                 self._audit.record(
-                    "task_requeued",
+                    "task_requeue_failed",
                     task_id,
-                    {"queue": queue, "retries": task["retries"]},
+                    {"reason": "invalid_state"},
                 )
-                return True
+                self._transition(task_id, TaskState.FAILED)
+                return False
+            if queue not in self._queues:
+                self._queues[queue] = PriorityQueue()
+            self._queues[queue].push(task, priority=task.get("priority", 0))
             self._audit.record(
-                "task_dropped",
+                "task_requeued",
                 task_id,
-                {"reason": "max_retries_exceeded"},
+                {"queue": queue, "retries": task["retries"]},
             )
+            return True
+        self._transition(task_id, TaskState.FAILED)
+        self._audit.record(
+            "task_dropped",
+            task_id,
+            {"reason": "max_retries_exceeded"},
+        )
         return False
+
+    def reclaim_stale(self, max_age_seconds: float = 300.0) -> int:
+        now = time.time()
+        stale_ids = [
+            tid
+            for tid, task in self._in_flight.items()
+            if now - task.get("enqueued_at", 0) > max_age_seconds
+        ]
+        for tid in stale_ids:
+            self._transition(tid, TaskState.FAILED)
+            self._in_flight.pop(tid, None)
+            self._audit.record(
+                "task_reclaimed",
+                tid,
+                {"reason": "stale", "max_age_seconds": max_age_seconds},
+            )
+        return len(stale_ids)
 
 # 2019-04-25T08:37:12 update
 
