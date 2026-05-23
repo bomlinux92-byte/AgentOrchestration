@@ -41,6 +41,24 @@ class ResourceExhaustedError(AgentOrchestratorError):
     def __init__(self, resource: str):
         super().__init__(f"Resource exhausted: {resource}")
 
+
+class DisabledPrincipalError(AgentOrchestratorError):
+    """Raised when a disabled, revoked, or expired principal attempts an action."""
+    def __init__(self, principal_id: str = None, reason: str = "principal is disabled"):
+        self.principal_id = principal_id
+        self.reason = reason
+        msg = f"Principal disabled: {principal_id or 'unknown'}" if principal_id else "Principal disabled"
+        super().__init__(msg)
+
+
+class InvalidPrincipalError(AgentOrchestratorError):
+    """Raised when a stale or invalid principal is detected."""
+    def __init__(self, principal_id: str = None, reason: str = "invalid principal"):
+        self.principal_id = principal_id
+        self.reason = reason
+        msg = f"Invalid principal: {principal_id or 'unknown'}" if principal_id else "Invalid principal"
+        super().__init__(msg)
+
 # 2019-01-25T13:21:06 update
 
 # 2019-02-15T19:31:32 update

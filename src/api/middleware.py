@@ -2,22 +2,61 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.common.errors import DisabledPrincipalError, InvalidPrincipalError
+from src.common.webhook_auth import get_webhook_auth_guard, WebhookAuthGuard
+
 logger = logging.getLogger(__name__)
 
 
+def _extract_principal_id(request: Request) -> Optional[str]:
+    """Extract principal ID from request Authorization header."""
+    auth_header = request.headers.get("Authorization", "")
+    scheme, _, credentials = auth_header.partition(" ")
+    if scheme.lower() == "bearer" and credentials.strip():
+        # In production, decode/validate JWT and extract principal_id
+        # For now, use the token as the principal_id
+        return credentials.strip()
+    return None
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, webhook_guard: Optional[WebhookAuthGuard] = None):
+        super().__init__(app)
+        self.webhook_guard = webhook_guard or get_webhook_auth_guard()
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
             auth_header = request.headers.get("Authorization", "")
             scheme, _, credentials = auth_header.partition(" ")
             if scheme.lower() != "bearer" or not credentials.strip():
                 return Response(status_code=401, content="Unauthorized")
+
+            # Check if this is a webhook management endpoint
+            if self._is_webhook_management_path(request.url.path):
+                principal_id = credentials.strip()
+                try:
+                    self.webhook_guard.check_principal(principal_id)
+                except DisabledPrincipalError as e:
+                    logger.warning("Disabled principal attempted webhook management: %s", principal_id)
+                    return Response(status_code=403, content=f"Principal disabled: {e.principal_id}")
+                except InvalidPrincipalError as e:
+                    logger.warning("Invalid principal attempted webhook management: %s", principal_id)
+                    return Response(status_code=401, content=f"Invalid principal: {e.principal_id}")
+
         return await call_next(request)
+
+    def _is_webhook_management_path(self, path: str) -> bool:
+        """Check if the path is a webhook management endpoint."""
+        webhook_paths = (
+            "/api/v2/webhooks",
+            "/api/v2/integrations",
+        )
+        return path.startswith(webhook_paths)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
