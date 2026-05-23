@@ -25,5 +25,7 @@ jobs:
         run: uv sync
       - name: Run tests
         run: uv run pytest --cov=src tests/
+      - name: Validate dependency review exceptions
+        run: uv run python scripts/validate_dependency_exceptions.py
       - name: Lint
         run: uv run flake8 src/ tests/
