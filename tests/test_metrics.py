@@ -1,3 +1,4 @@
+import math
 import pytest
 from src.common.metrics import MetricsCollector
 
@@ -30,6 +31,11 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_gauge_rejects_non_finite(self):
+        for value in [float("nan"), float("inf"), float("-inf")]:
+            with pytest.raises(ValueError, match="must be finite"):
+                self.metrics.gauge("test.nan", value)
 
 # 2019-07-16T09:29:21 update
 
