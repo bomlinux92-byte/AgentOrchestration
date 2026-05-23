@@ -34,6 +34,9 @@ class MetricsCollector:
         with self._lock:
             if metric in self._timers:
                 duration = time.time() - self._timers.pop(metric)
+                # Check if already observed to prevent double-observe on reentrant calls
+                if metric in self._histograms and duration in self._histograms[metric]:
+                    return duration
                 self.observe(metric, duration)
                 return duration
         return 0.0
