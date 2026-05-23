@@ -3,8 +3,32 @@
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+
+class SchedulerAuditLog:
+    """Audit log for scheduler limiter decisions."""
+
+    def __init__(self):
+        self._entries: List[Dict] = []
+
+    def record(self, event: str, task_id: str, details: Dict) -> None:
+        entry = {
+            "event": event,
+            "task_id": task_id,
+            "timestamp": time.time(),
+            **details,
+        }
+        self._entries.append(entry)
+
+    def get_entries(self, task_id: Optional[str] = None) -> List[Dict]:
+        if task_id is None:
+            return list(self._entries)
+        return [e for e in self._entries if e["task_id"] == task_id]
+
+    def clear(self) -> None:
+        self._entries.clear()
 
 
 class PriorityQueue:
@@ -36,6 +60,13 @@ class TaskScheduler:
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._audit = SchedulerAuditLog()
+        self._lock = asyncio.Lock()
+
+    @property
+    def audit_log(self) -> SchedulerAuditLog:
+        """Expose audit log for external access."""
+        return self._audit
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -58,27 +89,79 @@ class TaskScheduler:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled_time = self._scheduled.pop(tid, None)
+            if scheduled_time is not None:
+                self._audit.record(
+                    "schedule_expired",
+                    tid,
+                    {"scheduled_time": scheduled_time, "expire_time": now},
+                )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
+        async with self._lock:
+            if queue in self._queues and len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if task:
+                    self._in_flight[task["id"]] = task
+                    self._audit.record(
+                        "dequeue_allowed",
+                        task["id"],
+                        {
+                            "queue": queue,
+                            "in_flight_count": len(self._in_flight),
+                            "queue_depth": len(self._queues[queue]),
+                        },
+                    )
+                    return task
+
+        self._audit.record(
+            "dequeue_rejected",
+            "",
+            {
+                "queue": queue,
+                "reason": "queue_empty",
+                "in_flight_count": len(self._in_flight),
+            },
+        )
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task:
+            self._audit.record(
+                "task_completed",
+                task_id,
+                {"queue": task.get("queue", "default")},
+            )
+            return True
+        self._audit.record(
+            "task_complete_failed",
+            task_id,
+            {"reason": "not_in_flight"},
+        )
+        return False
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
+            self._audit.record(
+                "task_failed",
+                task_id,
+                {"retries": task["retries"], "max_retries": self._max_retries},
+            )
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._audit.record(
+                    "task_requeued",
+                    task_id,
+                    {"queue": queue, "retries": task["retries"]},
+                )
                 return True
+            self._audit.record(
+                "task_dropped",
+                task_id,
+                {"reason": "max_retries_exceeded"},
+            )
         return False
 
 # 2019-04-25T08:37:12 update

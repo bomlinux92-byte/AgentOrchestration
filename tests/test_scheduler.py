@@ -36,6 +36,73 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_audit_log_records_dequeue(self):
+        self.scheduler.enqueue({"type": "test", "payload": {}})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        entries = self.scheduler.audit_log.get_entries(task["id"])
+        assert len(entries) >= 1
+        assert any(e["event"] == "dequeue_allowed" for e in entries)
+
+    def test_audit_log_records_complete(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        self.scheduler.complete(task["id"])
+        entries = self.scheduler.audit_log.get_entries(task["id"])
+        assert any(e["event"] == "task_completed" for e in entries)
+
+    def test_audit_log_records_fail_and_retry(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        self.scheduler.fail(task["id"])
+        entries = self.scheduler.audit_log.get_entries(task["id"])
+        assert any(e["event"] == "task_failed" for e in entries)
+        assert any(e["event"] == "task_requeued" for e in entries)
+
+    def test_audit_log_records_task_dropped_after_max_retries(self):
+        scheduler = TaskScheduler()
+        scheduler._max_retries = 1
+        scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        scheduler.fail(task["id"])
+        entries = scheduler.audit_log.get_entries(task["id"])
+        assert any(e["event"] == "task_dropped" for e in entries)
+
+    def test_audit_log_records_dequeue_rejected_empty_queue(self):
+        import asyncio
+        asyncio.run(self.scheduler.dequeue())
+        entries = self.scheduler.audit_log.get_entries()
+        assert any(e["event"] == "dequeue_rejected" for e in entries)
+
+    def test_audit_log_get_entries_by_task_id(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        entries = self.scheduler.audit_log.get_entries(task_id=task_id)
+        assert all(e["task_id"] == task_id for e in entries)
+
+    def test_audit_log_clear(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        asyncio.run(self.scheduler.dequeue())
+        assert len(self.scheduler.audit_log.get_entries()) > 0
+        self.scheduler.audit_log.clear()
+        assert len(self.scheduler.audit_log.get_entries()) == 0
+
+    def test_stale_duplicate_transition_rejected_via_audit(self):
+        """Verify stale task completion attempts are logged and rejected."""
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(task["id"]) is True
+        assert self.scheduler.complete(task["id"]) is False
+        failed_entries = self.scheduler.audit_log.get_entries(task["id"])
+        assert any(e["event"] == "task_complete_failed" for e in failed_entries)
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
