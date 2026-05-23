@@ -36,6 +36,8 @@ class TaskScheduler:
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._claimed: set = set()
+        self._lock = asyncio.Lock()
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -51,16 +53,18 @@ class TaskScheduler:
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        self._scheduled[task_id] = (task, time.time() + delay)
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+        async with self._lock:
+            now = time.time()
+            expired = [tid for tid, (t, exp) in self._scheduled.items() if exp <= now and tid not in self._claimed]
+            for tid in expired:
+                self._claimed.add(tid)
+                (task, _) = self._scheduled.pop(tid)
+                if task:
+                    self.enqueue(task, queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()

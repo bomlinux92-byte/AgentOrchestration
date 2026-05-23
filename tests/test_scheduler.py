@@ -153,3 +153,26 @@ class TestTaskScheduler:
 # 2026-01-12T16:53:28 update
 
 # 2026-04-16T16:58:23 update
+
+    def test_dequeue_deduplicates_scheduled_tasks(self):
+        """Regression: scheduled tasks should only be enqueued once even with concurrent dequeues."""
+        import asyncio
+
+        async def run():
+            s = TaskScheduler()
+            # Schedule a task with immediate expiry
+            task_data = {"type": "cron", "data": "test"}
+            tid = s.schedule(task_data, delay=0)
+
+            # Simulate concurrent dequeues from multiple replicas
+            results = await asyncio.gather(
+                s.dequeue(),
+                s.dequeue(),
+                s.dequeue(),
+            )
+            # Only one should get the task
+            tasks_dequeued = [r for r in results if r is not None]
+            assert len(tasks_dequeued) == 1, f"Expected 1 task, got {len(tasks_dequeued)} (duplicate cron tick)"
+
+        asyncio.run(run())
+
