@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 from src.common.config import Config
 from src.common.logging import configure_logging
@@ -33,6 +34,11 @@ def cli():
         configure_logging("DEBUG")
     else:
         configure_logging("INFO")
+
+    # Expand user paths and resolve relative paths before loading config
+    if args.config:
+        config_path = Path(args.config).expanduser().resolve()
+        args.config = str(config_path)
 
     if args.command == "init":
         print(f"Initializing project: {args.name}")
