@@ -31,6 +31,32 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_reset_clears_all_state(self):
+        """Regression: reset() clears counters, gauges, histograms, timers."""
+        self.metrics.increment("requests.total")
+        self.metrics.increment("requests.total")
+        self.metrics.gauge("memory.usage", 85.5)
+        self.metrics.observe("response.time", 0.5)
+        self.metrics.start_timer("operation")
+
+        self.metrics.reset()
+
+        snap = self.metrics.snapshot()
+        assert snap["counters"] == {}
+        assert snap["gauges"] == {}
+        assert snap["histograms"] == {}
+
+    def test_reset_enables_reuse(self):
+        """Regression: collector can be reused after reset without stale data."""
+        self.metrics.increment("requests.total")
+        self.metrics.gauge("memory.usage", 100.0)
+        self.metrics.reset()
+
+        self.metrics.increment("requests.total")
+        snap = self.metrics.snapshot()
+        assert snap["counters"]["requests.total"] == 1
+        assert snap["gauges"]["memory.usage"] == 100.0
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update
