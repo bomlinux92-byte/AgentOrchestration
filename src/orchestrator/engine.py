@@ -65,9 +65,12 @@ class OrchestrationEngine:
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
+            self.scheduler.complete(task_id)
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
+            self.registry.update_status(agent_id, AgentStatus.FAILED)
+            self.scheduler.fail(task_id)
             logger.error(f"Task {task_id} failed: {e}")
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
