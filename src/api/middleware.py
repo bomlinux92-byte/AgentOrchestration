@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+            auth_header = request.headers.get("Authorization", "")
+            scheme, _, credentials = auth_header.partition(" ")
+            if scheme.lower() != "bearer" or not credentials.strip():
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
 
