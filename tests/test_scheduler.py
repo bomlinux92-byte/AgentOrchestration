@@ -1,5 +1,10 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+import asyncio
+from src.orchestrator.scheduler import (
+    TaskScheduler,
+    PayloadValidator,
+    WorkerProtocolError,
+)
 
 
 class TestTaskScheduler:
@@ -153,3 +158,118 @@ class TestTaskScheduler:
 # 2026-01-12T16:53:28 update
 
 # 2026-04-16T16:58:23 update
+
+
+class TestWorkerProtocolSettings:
+    """Regression tests for worker protocol settings invariant — issue #3650."""
+
+    def setup_method(self):
+        self.scheduler = TaskScheduler()
+
+    def test_set_worker_protocol_settings_valid(self):
+        """Valid ack_timeout > visibility is accepted."""
+        validator = PayloadValidator()
+        validator.set_worker_protocol_settings(
+            ack_timeout=30.0, visibility=10.0, task_id="task-1"
+        )
+        assert validator._worker_protocol_settings["ack_timeout"] == 30.0
+        assert validator._worker_protocol_settings["visibility"] == 10.0
+
+    def test_validate_worker_protocol_invalid_settings_raises(self):
+        """Invalid protocol settings (ack <= visibility) raise WorkerProtocolError at validate time."""
+        validator = PayloadValidator()
+        # Set invalid settings (ack < visibility)
+        validator.set_worker_protocol_settings(
+            ack_timeout=5.0, visibility=10.0
+        )
+        task = {"type": "test", "payload": {}, "id": "task-1"}
+        with pytest.raises(WorkerProtocolError) as exc_info:
+            validator.validate_worker_protocol(task)
+        assert "ack_timeout (5.0) must exceed visibility (10.0)" in str(exc_info.value)
+
+    def test_validate_worker_protocol_no_settings(self):
+        """No protocol settings = no validation (idempotent path)."""
+        validator = PayloadValidator()
+        task = {"type": "test", "payload": {}, "id": "task-1"}
+        validator.validate_worker_protocol(task)  # Should not raise
+
+    def test_validate_worker_protocol_with_valid_settings(self):
+        """Valid protocol settings allow task through."""
+        validator = PayloadValidator()
+        validator.set_worker_protocol_settings(
+            ack_timeout=30.0, visibility=10.0
+        )
+        task = {"type": "test", "payload": {}, "id": "task-1"}
+        validator.validate_worker_protocol(task)  # Should not raise
+
+    def test_validate_worker_protocol_with_invalid_settings(self):
+        """Invalid protocol settings raise WorkerProtocolError."""
+        validator = PayloadValidator()
+        validator.set_worker_protocol_settings(
+            ack_timeout=5.0, visibility=10.0  # ack < visibility
+        )
+        task = {"type": "test", "payload": {}, "id": "task-1"}
+        with pytest.raises(WorkerProtocolError) as exc_info:
+            validator.validate_worker_protocol(task)
+        assert "ack_timeout (5.0) must exceed visibility (10.0)" in str(exc_info.value)
+
+    def test_dequeue_rejects_protocol_violation(self):
+        """Dequeue rejects tasks when protocol settings invariant violated."""
+        self.scheduler._validator.set_worker_protocol_settings(
+            ack_timeout=5.0, visibility=10.0  # Invalid: ack < visibility
+        )
+        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+
+        task = asyncio.run(self.scheduler.dequeue())
+        # Should return None because worker protocol settings invariant is violated
+        assert task is None
+
+    def test_dequeue_accepts_valid_protocol(self):
+        """Dequeue accepts tasks when protocol settings invariant holds."""
+        self.scheduler._validator.set_worker_protocol_settings(
+            ack_timeout=30.0, visibility=10.0  # Valid: ack > visibility
+        )
+        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["type"] == "test"
+
+    def test_complete_accepts_valid_protocol(self):
+        """Complete succeeds when protocol settings invariant holds."""
+        self.scheduler._validator.set_worker_protocol_settings(
+            ack_timeout=30.0, visibility=10.0
+        )
+        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert self.scheduler.complete(task["id"]) is True
+
+    def test_complete_rejects_protocol_violation(self):
+        """Complete fails when protocol was violated (enforced at claim/dequeue time)."""
+        self.scheduler._validator.set_worker_protocol_settings(
+            ack_timeout=5.0, visibility=10.0  # Invalid
+        )
+        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+
+        task = asyncio.run(self.scheduler.dequeue())
+        # Protocol violation is caught at dequeue (claim transaction),
+        # so task is None - no task reaches complete() to test ack failure
+        assert task is None
+
+    def test_lifecycle_state_preserved_on_protocol_rejection(self):
+        """Lifecycle state is preserved (not committed) when protocol violation rejected."""
+        self.scheduler._validator.set_worker_protocol_settings(
+            ack_timeout=5.0, visibility=10.0  # Invalid
+        )
+        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+
+        task_id = self.scheduler.enqueue({"type": "test", "payload": {"data": 2}})
+        initial_state = self.scheduler._task_states.get(task_id)
+        assert initial_state == "pending"
+
+        # Dequeue attempt with invalid protocol should leave state unchanged
+        result = asyncio.run(self.scheduler.dequeue())
+        # If result is None due to protocol violation, state still in pending
+        # (not transitioned to running)

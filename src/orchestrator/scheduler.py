@@ -33,6 +33,12 @@ class StaleTaskError(QueuePayloadError):
         super().__init__(f"Stale task rejected: {reason}", task_id)
 
 
+class WorkerProtocolError(QueuePayloadError):
+    """Raised when worker protocol settings invariant is violated."""
+    def __init__(self, task_id: str, reason: str):
+        super().__init__(f"Worker protocol violation: {reason}", task_id)
+
+
 class PayloadValidator:
     """Validates queue job payloads to ensure invariants are maintained."""
 
@@ -42,6 +48,46 @@ class PayloadValidator:
     def __init__(self):
         self._seen_task_ids: Set[str] = set()
         self._metrics = metrics
+        self._worker_protocol_settings: Dict[str, Any] = {}
+
+    def set_worker_protocol_settings(
+        self, ack_timeout: float, visibility: float, task_id: str = None
+    ) -> None:
+        """Set worker protocol settings.
+
+        The ack_timeout > visibility invariant is validated at claim/enqueue/ack
+        time, not at configuration time, to allow safe deferral.
+
+        Args:
+            ack_timeout: Acknowledgment timeout
+            visibility: Visibility timeout
+            task_id: Optional task ID for logging
+        """
+        self._worker_protocol_settings = {
+            "ack_timeout": ack_timeout,
+            "visibility": visibility,
+        }
+
+    def validate_worker_protocol(self, task: Dict[str, Any]) -> None:
+        """Validate task respects worker protocol settings.
+
+        Ensures that when a task is claimed/enqueued/acked, the ack timeout
+        exceeds the visibility window to prevent duplicate delivery.
+
+        Raises:
+            WorkerProtocolError: If worker protocol invariant is violated
+        """
+        settings = self._worker_protocol_settings
+        if not settings:
+            return  # No protocol settings configured, skip validation
+
+        ack_timeout = settings.get("ack_timeout", 0)
+        visibility = settings.get("visibility", 0)
+
+        if ack_timeout <= visibility:
+            reason = f"ack_timeout ({ack_timeout}) must exceed visibility ({visibility})"
+            logger.warning(f"Worker protocol violation for task {task.get('id')}: {reason}")
+            raise WorkerProtocolError(task.get("id", "unknown"), reason)
 
     def validate(self, task: Dict[str, Any]) -> None:
         if not task or not isinstance(task, dict):
@@ -85,31 +131,32 @@ class PayloadValidator:
         # Record metrics for validation success
         self._metrics.increment("scheduler.payload_validated")
     def validate_lifecycle_transition(
-        self, 
-        task_id: str, 
-        current_state: str, 
+        self,
+        task_id: str,
+        current_state: str,
         proposed_state: str,
         allowed_transitions: Dict[str, Set[str]]
     ) -> None:
         """
         Validate a lifecycle state transition.
-        
+
         Args:
             task_id: The task identifier
             current_state: Current lifecycle state
             proposed_state: Proposed new state
             allowed_transitions: Map of current_state -> set of allowed next states
-            
+
         Raises:
             StaleTaskError: If the transition is not allowed
+            WorkerProtocolError: If worker protocol settings invariant is violated
         """
         allowed = allowed_transitions.get(current_state, set())
         if proposed_state not in allowed:
             raise StaleTaskError(
-                task_id, 
+                task_id,
                 f"Invalid transition {current_state} -> {proposed_state}"
             )
-        
+
         logger.info(
             f"Validated transition for task {task_id}: {current_state} -> {proposed_state}"
         )
@@ -217,11 +264,17 @@ class TaskScheduler:
                         "running",
                         self.LIFECYCLE_TRANSITIONS
                     )
+                    # Validate worker protocol settings (ack_timeout > visibility)
+                    self._validator.validate_worker_protocol(task)
                 except StaleTaskError as e:
                     logger.warning(f"Rejecting stale task {task_id}: {e.reason}")
                     metrics.increment("scheduler.task_rejected_stale")
                     return None
-                
+                except WorkerProtocolError as e:
+                    logger.warning(f"Rejecting task {task_id} due to worker protocol violation: {e.reason}")
+                    metrics.increment("scheduler.task_rejected_protocol")
+                    return None
+
                 # Update state to running
                 self._task_states[task_id] = "running"
                 self._in_flight[task_id] = task
@@ -241,6 +294,8 @@ class TaskScheduler:
                     "completed",
                     self.LIFECYCLE_TRANSITIONS
                 )
+                # Validate worker protocol settings before ack (claim transaction)
+                self._validator.validate_worker_protocol(task)
                 self._task_states[task_id] = "completed"
                 # Clear from seen set to allow new task with same payload
                 self._validator.clear_seen_task(task_id)
@@ -248,6 +303,10 @@ class TaskScheduler:
                 return True
             except StaleTaskError:
                 metrics.increment("scheduler.task_rejected_stale")
+                return False
+            except WorkerProtocolError as e:
+                logger.warning(f"Task {task_id} ack rejected: {e.reason}")
+                metrics.increment("scheduler.task_rejected_protocol")
                 return False
         return False
 
