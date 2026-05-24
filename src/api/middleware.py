@@ -2,12 +2,70 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, List, Sequence
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
 logger = logging.getLogger(__name__)
+
+CREDENTIAL_HEADERS = {"authorization", "cookie"}
+SENSITIVE_LOG_KEYS = {"authorization", "cookie", "set-cookie", "proxy-authorization"}
+
+
+class CORSCredentialMiddleware(BaseHTTPMiddleware):
+    """Enforce CORS allowlist on credentialed requests from browser clients.
+
+    When a request carries credentials (cookies or authorization headers) and
+    includes an Origin header (indicating a browser client), the Origin must
+    match the configured allowlist. Non-credentialed requests and requests
+    without an Origin header (non-browser clients) pass through unchanged.
+    """
+
+    def __init__(self, app, allowed_origins: Sequence[str]):
+        super().__init__(app)
+        self._allowed_origins: set[str] = set(allowed_origins)
+        self._wildcard = "*" in self._allowed_origins
+
+    def _is_credentialed(self, request: Request) -> bool:
+        has_auth = bool(request.headers.get("authorization"))
+        has_cookie = bool(request.headers.get("cookie"))
+        return has_auth or has_cookie
+
+    def _origin_allowed(self, origin: str) -> bool:
+        if self._wildcard:
+            return False  # wildcard is never valid for credentialed requests
+        return origin in self._allowed_origins
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        request.state._cors_origin_checked = False
+        try:
+            origin = request.headers.get("origin")
+
+            # Only enforce for browser clients (Origin header present) with credentials
+            if origin and self._is_credentialed(request):
+                if not self._origin_allowed(origin):
+                    logger.warning(
+                        "CORS credential request rejected: origin=%s path=%s method=%s",
+                        origin, request.url.path, request.method,
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "CORS policy: credentialed requests are not allowed from this origin"},
+                    )
+                request.state._cors_origin_checked = True
+
+            response = await call_next(request)
+
+            # Set specific Access-Control-Allow-Origin for credentialed allowed requests
+            if origin and getattr(request.state, "_cors_origin_checked", False):
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Vary"] = "Origin"
+
+            return response
+        finally:
+            if hasattr(request.state, "_cors_origin_checked"):
+                del request.state._cors_origin_checked
 
 
 class AuthMiddleware(BaseHTTPMiddleware):

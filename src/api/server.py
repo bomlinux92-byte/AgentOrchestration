@@ -1,14 +1,21 @@
 """FastAPI application server."""
 
 import os
-from typing import Dict
+import logging
+from typing import Dict, List
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from .routes import router
-from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
+from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware, CORSCredentialMiddleware
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_origins(raw: str) -> List[str]:
+    return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 def create_app(config: Dict = None) -> FastAPI:
@@ -20,13 +27,31 @@ def create_app(config: Dict = None) -> FastAPI:
         redoc_url="/api/redoc",
     )
 
+    cors_origins = _parse_origins(os.getenv("CORS_ORIGINS", "*"))
+
+    has_wildcard = "*" in cors_origins
+    allow_credentials_env = os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() in ("true", "1", "yes")
+
+    if has_wildcard and allow_credentials_env:
+        logger.warning(
+            "CORS_ORIGINS contains wildcard '*' which is insecure with credentials. "
+            "Credentialed requests will be rejected unless an explicit allowlist is configured."
+        )
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=allow_credentials_env,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Enforce CORS allowlist specifically for credentialed browser requests.
+    # This runs before AuthMiddleware so unallowed credentialed origins are
+    # rejected before any authentication work is done.
+    explicit_origins = [o for o in cors_origins if o != "*"]
+    if explicit_origins:
+        app.add_middleware(CORSCredentialMiddleware, allowed_origins=explicit_origins)
 
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
 
