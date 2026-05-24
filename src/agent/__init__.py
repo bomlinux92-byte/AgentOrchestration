@@ -1,12 +1,11 @@
 """Agent lifecycle management module."""
 
-from .registry import AgentRegistry
+from .registry import AgentRegistry, AgentStatus
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
 from .sandbox import AgentSandbox
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
-
+__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox", "AgentStatus"]
 # 2019-02-05T12:34:30 update
 
 # 2019-02-22T12:15:15 update
@@ -14,8 +13,6 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 # 2019-03-12T15:14:33 update
 
 # 2019-03-18T18:05:18 update
-
-# 2019-03-27T08:39:35 update
 
 # 2019-04-02T18:05:03 update
 
@@ -25,7 +22,7 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 
 # 2019-06-12T20:42:33 update
 
-# 2019-07-05T16:21:40 update
+# 2019-07-05T16:21:56 update
 
 # 2019-09-24T18:27:18 update
 
@@ -37,13 +34,13 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 
 # 2019-11-09T12:34:46 update
 
-# 2019-12-16T08:46:26 update
+# 2019-12-16T08:46:46 update
 
-# 2020-09-14T09:41:32 update
+# 2020-09-14T09:41:14 update
 
 # 2020-10-18T20:50:45 update
 
-# 2020-12-05T15:20:44 update
+# 2020-12-05T15:20:40 update
 
 # 2020-12-25T10:16:40 update
 
@@ -51,7 +48,7 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 
 # 2021-02-23T19:57:00 update
 
-# 2021-04-16T12:14:32 update
+# 2021-04-16T12:14:24 update
 
 # 2021-08-09T17:01:55 update
 
@@ -63,7 +60,7 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 
 # 2022-03-22T14:50:48 update
 
-# 2022-05-24T17:48:50 update
+# 2022-05-24T17:48:56 update
 
 # 2022-07-15T10:30:56 update
 
@@ -91,7 +88,7 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 
 # 2023-08-14T14:24:11 update
 
-# 2023-11-13T12:57:31 update
+# 2023-11-13T12:57:13 update
 
 # 2024-01-31T08:01:32 update
 
@@ -103,7 +100,7 @@ __all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
 
 # 2024-05-17T20:03:20 update
 
-# 2024-08-15T13:05:30 update
+# 2024-08-15T13:05:15 update
 
 # 2024-09-16T20:55:55 update
 
