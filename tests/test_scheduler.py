@@ -1,5 +1,7 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+import asyncio
+import time
+from src.orchestrator.scheduler import TaskScheduler, TaskState
 
 
 class TestTaskScheduler:
@@ -12,7 +14,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +21,182 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_fail_idempotent_when_already_terminal(self):
+        """Test that fail() is idempotent - calling on already completed task returns False."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        # Complete the task
+        assert self.scheduler.complete(task["id"]) is True
+        # Try to fail an already completed task - should return False
+        assert self.scheduler.fail(task["id"]) is False
+
+    def test_complete_idempotent_when_already_failed(self):
+        """Test that complete() is idempotent - calling on already failed task returns False."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        # Fail the task (exhaust retries)
+        for _ in range(self.scheduler._max_retries):
+            if not self.scheduler.fail(task["id"]):
+                break
+        # Try to complete an already failed task - should return False
+        assert self.scheduler.complete(task["id"]) is False
+
+    def test_retry_respects_max_retries(self):
+        """Test that task fails permanently after max retries."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        # Fail up to max retries
+        for i in range(self.scheduler._max_retries):
+            result = self.scheduler.fail(task_id)
+            if not result:
+                break
+        
+        # Next fail should return False (terminal state)
+        assert self.scheduler.fail(task_id) is False
+        # Task state should be FAILED
+        assert self.scheduler.get_task_state(task_id) == TaskState.FAILED
+
+    def test_terminal_outcome_recorded_on_completion(self):
+        """Test that completing a task records durable terminal outcome."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        self.scheduler.complete(task_id)
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        
+        assert outcome is not None
+        assert outcome["status"] == "completed"
+        assert "completed_at" in outcome
+
+    def test_terminal_outcome_recorded_on_failure(self):
+        """Test that exhausting retries records durable terminal outcome."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        # Exhaust retries
+        for _ in range(self.scheduler._max_retries):
+            self.scheduler.fail(task_id)
+        
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        
+        assert outcome is not None
+        assert outcome["status"] == "failed"
+        assert outcome["retries"] == self.scheduler._max_retries
+
+    def test_cancel_task(self):
+        """Test that cancelling a task marks it as terminal."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        assert self.scheduler.cancel(task_id) is True
+        assert self.scheduler.get_task_state(task_id) == TaskState.CANCELLED
+        
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "cancelled"
+
+    def test_cancel_idempotent(self):
+        """Test that cancelling an already cancelled task returns False."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        self.scheduler.cancel(task_id)
+        # Cancel again - should return False
+        assert self.scheduler.cancel(task_id) is False
+
+    def test_dequeue_skips_terminal_tasks(self):
+        """Test that dequeue skips tasks that are already in terminal state."""
+        self.scheduler.enqueue({"type": "test1"})
+        self.scheduler.enqueue({"type": "test2"})
+        
+        # Complete first task
+        task1 = asyncio.run(self.scheduler.dequeue())
+        self.scheduler.complete(task1["id"])
+        
+        # Dequeue should still work for task2
+        task2 = asyncio.run(self.scheduler.dequeue())
+        assert task2 is not None
+        assert task2["type"] == "test2"
+
+    def test_retry_with_jitter_delay(self):
+        """Test that retry uses jittered delay within bounds."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        self.scheduler.fail(task_id)
+        
+        # Check that retry_at is set and within expected bounds
+        scheduled = self.scheduler._scheduled.get(task_id)
+        assert scheduled is not None
+        delay, _ = scheduled
+        
+        # Delay should be between RETRY_BASE_DELAY and RETRY_MAX_DELAY
+        assert 1.0 <= delay <= 30.0
+
+    def test_task_state_transitions(self):
+        """Test that task state transitions are tracked correctly."""
+        self.scheduler.enqueue({"type": "test"})
+        
+        # Initial state should be None (not tracked)
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        assert self.scheduler.get_task_state(task_id) == TaskState.IN_FLIGHT
+        
+        self.scheduler.complete(task_id)
+        assert self.scheduler.get_task_state(task_id) == TaskState.COMPLETED
+
+    def test_no_stale_locks_on_completion(self):
+        """Test that completing a task removes it from in_flight."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        self.scheduler.complete(task_id)
+        
+        # Task should not be in in_flight
+        assert task_id not in self.scheduler._in_flight
+
+    def test_no_stale_locks_on_failure(self):
+        """Test that failing a task removes it from in_flight."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        self.scheduler.fail(task_id)
+        
+        # Task should not be in in_flight (it's in _scheduled for retry)
+        assert task_id not in self.scheduler._in_flight
+
+    def test_cancel_removes_from_all_tracking(self):
+        """Test that cancelling removes task from all tracking structures."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        self.scheduler.cancel(task_id)
+        
+        # Task should not be in any tracking structure
+        assert task_id not in self.scheduler._in_flight
+        assert task_id not in self.scheduler._scheduled
 
 # 2019-01-09T19:07:03 update
 
