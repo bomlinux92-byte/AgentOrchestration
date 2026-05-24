@@ -1,13 +1,13 @@
 """FastAPI application server."""
 
 import os
-from typing import Dict
+from typing import Dict, Any
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
-from .routes import router
+from .routes import router, redact_execution_metadata
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
 
 
@@ -36,9 +36,30 @@ def create_app(config: Dict = None) -> FastAPI:
 
     app.include_router(router, prefix="/api/v2")
 
+    def _get_public_health(include_execution_metadata: bool = False) -> Dict[str, Any]:
+        """Build public health response with optional redacted diagnostics."""
+        health = {"status": "healthy", "version": "2.4.1"}
+        if include_execution_metadata:
+            exec_metadata = {
+                "execution_id": "exec-12345",
+                "agent_id": "agent-abc",
+                "task_id": "task-xyz",
+                "timestamp": 1716600000.0,
+            }
+            health["diagnostics"] = redact_execution_metadata(exec_metadata, redact=True)
+        return health
+
     @app.get("/health")
-    async def health():
-        return {"status": "healthy", "version": "2.4.1"}
+    async def health(include_execution_metadata: bool = False):
+        """Public health endpoint with optional redacted execution metadata.
+        
+        Args:
+            include_execution_metadata: Include redacted execution metadata in response
+        
+        Returns:
+            Public health response
+        """
+        return _get_public_health(include_execution_metadata=include_execution_metadata)
 
     return app
 
