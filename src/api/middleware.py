@@ -1,21 +1,62 @@
 """API middleware components."""
 
 import time
+import re
 import logging
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 
 logger = logging.getLogger(__name__)
 
 
+def _is_internal_route(path: str) -> bool:
+    """Check if path is an internal/documentation route that needs auth."""
+    internal_patterns = [
+        r"^/api/v2/openapi\.json$",
+        r"^/api/docs",
+        r"^/api/redoc",
+    ]
+    return any(re.match(p, path) for p in internal_patterns)
+
+
+def _validate_token(token: str) -> bool:
+    """Validate bearer token format and non-emptiness."""
+    if not token:
+        return False
+    if not token.startswith("Bearer "):
+        return False
+    token_value = token[7:].strip()
+    if not token_value:
+        return False
+    # Token must be non-empty after "Bearer " prefix
+    # Reject obviously malformed tokens (e.g. just "Bearer ")
+    return True
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+        path = request.url.path
+
+        # Auth-protected API routes (excluding auth token endpoint)
+        if path.startswith("/api/v2") and path != "/api/v2/auth/token":
+            auth_header = request.headers.get("Authorization", "")
+            if not _validate_token(auth_header):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized: valid Bearer token required"},
+                )
+
+        # Documentation/internal routes must also have valid auth
+        if _is_internal_route(path):
+            auth_header = request.headers.get("Authorization", "")
+            if not _validate_token(auth_header):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized: valid Bearer token required"},
+                )
+
         return await call_next(request)
 
 
