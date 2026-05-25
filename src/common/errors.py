@@ -47,6 +47,26 @@ class ResultSerializationError(AgentOrchestratorError):
         super().__init__(f"Result serialization failed for execution {execution_id}: {reason}")
 
 
+class WebhookError(AgentOrchestratorError):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class WebhookEventTypeError(WebhookError):
+    def __init__(self, event_type: str):
+        super().__init__(f"Event type not allowed: {event_type}")
+
+
+class WebhookEndpointDisabledError(WebhookError):
+    def __init__(self, subscription_id: str):
+        super().__init__(f"Webhook endpoint is disabled: {subscription_id}")
+
+
+class WebhookNotFoundError(WebhookError):
+    def __init__(self, subscription_id: str):
+        super().__init__(f"Webhook subscription not found: {subscription_id}")
+
+
 class VersionError(AgentOrchestratorError):
     def __init__(self, version: str):
         super().__init__(f"Invalid version string: {version}. Expected semver format (e.g., 1.0.0)")
