@@ -44,6 +44,23 @@ class AgentSandbox:
         except (ValueError, resource.error) as e:
             pass
 
+    def get_preexec_fn(self, limits: ResourceLimits):
+        """Return a preexec_fn function that applies resource limits in a child process.
+
+        This must be used as the preexec_fn argument to subprocess.Popen to ensure
+        limits are applied in the child process before exec(), not in the parent.
+        This prevents per-agent limits from affecting unrelated agents running
+        in the same parent process (issue #3982).
+        """
+        def _apply_limits():
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+                mem_bytes = limits.memory_mb * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+            except (ValueError, resource.error):
+                pass
+        return _apply_limits
+
     def cleanup_all(self) -> None:
         for agent_id in list(self._sandboxes.keys()):
             self.destroy(agent_id)
