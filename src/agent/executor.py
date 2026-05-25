@@ -1,20 +1,61 @@
 """Agent Executor — Handles task execution within agent sandboxes."""
 
 import asyncio
+import json
 import time
+from enum import Enum
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
 
+class ExecutionState(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    VALIDATING = "validating"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+_VALID_TRANSITIONS = {
+    ExecutionState.PENDING: {ExecutionState.RUNNING, ExecutionState.CANCELLED},
+    ExecutionState.RUNNING: {ExecutionState.VALIDATING, ExecutionState.FAILED, ExecutionState.CANCELLED},
+    ExecutionState.VALIDATING: {ExecutionState.COMPLETED, ExecutionState.FAILED},
+}
+
+
+def validate_json_serializable(data: Any) -> None:
+    """Raise TypeError if data cannot be serialized to JSON."""
+    try:
+        json.dumps(data)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(f"Result is not JSON-serializable: {exc}") from exc
+
+
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(self, max_concurrent: int = 5, max_retries: int = 3):
         self.max_concurrent = max_concurrent
+        self.max_retries = max_retries
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._execution_states: Dict[str, ExecutionState] = {}
+        self._retry_counts: Dict[str, int] = {}
+
+    def _transition(self, execution_id: str, new_state: ExecutionState) -> None:
+        current = self._execution_states.get(execution_id, ExecutionState.PENDING)
+        allowed = _VALID_TRANSITIONS.get(current, set())
+        if new_state not in allowed:
+            raise RuntimeError(
+                f"Invalid state transition for execution {execution_id}: "
+                f"{current.value} -> {new_state.value}"
+            )
+        self._execution_states[execution_id] = new_state
 
     async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
         execution_id = str(uuid4())
+        self._execution_states[execution_id] = ExecutionState.PENDING
+        self._retry_counts[execution_id] = 0
         async with self._semaphore:
             task_obj = asyncio.create_task(
                 self._run_execution(execution_id, agent_id, task, handler)
@@ -24,16 +65,20 @@ class AgentExecutor:
                 result = await task_obj
                 self._results[execution_id] = result
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._results[execution_id] = {"error": str(e), "execution_id": execution_id}
+                if self._execution_states.get(execution_id) != ExecutionState.CANCELLED:
+                    self._execution_states[execution_id] = ExecutionState.FAILED
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
     async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+        self._transition(exec_id, ExecutionState.RUNNING)
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
-        return {
+
+        envelope = {
             "execution_id": exec_id,
             "agent_id": agent_id,
             "task_id": task.get("id"),
@@ -42,6 +87,14 @@ class AgentExecutor:
             "timestamp": time.time(),
         }
 
+        self._transition(exec_id, ExecutionState.VALIDATING)
+        validate_json_serializable(envelope)
+        self._transition(exec_id, ExecutionState.COMPLETED)
+        return envelope
+
+    def get_state(self, execution_id: str) -> ExecutionState:
+        return self._execution_states.get(execution_id, ExecutionState.PENDING)
+
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
 
@@ -49,12 +102,14 @@ class AgentExecutor:
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
             task.cancel()
+            self._execution_states[execution_id] = ExecutionState.CANCELLED
             return True
         return False
 
     async def shutdown(self) -> None:
-        for task in self._active_tasks.values():
+        for eid, task in self._active_tasks.items():
             task.cancel()
+            self._execution_states[eid] = ExecutionState.CANCELLED
         if self._active_tasks:
             await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
 

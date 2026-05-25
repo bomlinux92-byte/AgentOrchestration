@@ -42,6 +42,11 @@ class ResourceExhaustedError(AgentOrchestratorError):
         super().__init__(f"Resource exhausted: {resource}")
 
 
+class ResultSerializationError(AgentOrchestratorError):
+    def __init__(self, execution_id: str, reason: str):
+        super().__init__(f"Result serialization failed for execution {execution_id}: {reason}")
+
+
 class VersionError(AgentOrchestratorError):
     def __init__(self, version: str):
         super().__init__(f"Invalid version string: {version}. Expected semver format (e.g., 1.0.0)")

@@ -1,6 +1,7 @@
 """Orchestration Engine — Core execution and coordination logic."""
 
 import asyncio
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
@@ -18,6 +19,7 @@ class OrchestrationEngine:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
+        self._task_outcomes: Dict[str, Dict[str, Any]] = {}
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -42,9 +44,28 @@ class OrchestrationEngine:
         self._running = False
         logger.info("Orchestration engine stopped")
 
+    def _validate_result(self, result: Any) -> None:
+        """Validate that the result is JSON-serializable before processing."""
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError(f"Task result is not JSON-serializable: {exc}") from exc
+
+    def _record_outcome(self, task_id: str, outcome: Dict[str, Any]) -> None:
+        """Persist a durable terminal outcome for a task."""
+        if task_id in self._task_outcomes:
+            logger.warning(f"Task {task_id} already has a recorded outcome, skipping duplicate")
+            return
+        self._task_outcomes[task_id] = outcome
+
     async def _execute_task(self, task: Dict[str, Any]) -> None:
         task_id = task["id"]
         agent_id = task["target_agent"]
+
+        if task_id in self._task_outcomes:
+            logger.warning(f"Task {task_id} already completed, skipping duplicate execution")
+            return
+
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
         for hook in self._hooks["pre_execute"]:
@@ -60,15 +81,36 @@ class OrchestrationEngine:
                 self._run_agent_task(agent, task),
                 timeout=self.agent_timeout,
             )
+
+            self._validate_result(result)
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
+            self._record_outcome(task_id, {
+                "status": "completed",
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "result": result,
+            })
+            self.scheduler.complete(task_id)
 
             for hook in self._hooks["post_execute"]:
+                await hook(task, result)
+
+            for hook in self._hooks["on_complete"]:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.registry.update_status(agent_id, AgentStatus.FAILED)
+            self._record_outcome(task_id, {
+                "status": "failed",
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "error": str(e),
+            })
+            self.scheduler.fail(task_id)
+
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
