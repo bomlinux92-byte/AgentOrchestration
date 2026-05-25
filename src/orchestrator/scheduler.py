@@ -2,9 +2,21 @@
 
 import asyncio
 import heapq
+import random
 import time
+from enum import Enum
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+
+class TaskState(Enum):
+    """Task state machine states for idempotent transitions."""
+    PENDING = "pending"
+    SCHEDULED = "scheduled"
+    IN_FLIGHT = "in_flight"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class PriorityQueue:
@@ -31,11 +43,24 @@ class PriorityQueue:
 
 
 class TaskScheduler:
+    """Task scheduler with idempotent state transitions and duplicate compensation guards."""
+    
+    # Jitter configuration: base delay 1s, max delay 30s, multiplier 2x
+    RETRY_BASE_DELAY = 1.0
+    RETRY_MAX_DELAY = 30.0
+    RETRY_JITTER_FACTOR = 0.5
+
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, tuple] = {}  # task_id -> (delay, task)
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        # Track task state machine for idempotent transitions
+        self._task_states: Dict[str, TaskState] = {}
+        # Track terminal outcomes durably (task_id -> outcome)
+        self._terminal_outcomes: Dict[str, Dict] = {}
+        # Track pending retry scheduled times
+        self._retry_scheduled: Dict[str, float] = {}
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -51,35 +76,150 @@ class TaskScheduler:
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["scheduled_at"] = time.time()
+        task["retry_at"] = time.time() + delay
+        # Store (delay, task) tuple for later retrieval
+        self._scheduled[task_id] = (delay, task)
+        # Track scheduled state
+        self._task_states[task_id] = TaskState.SCHEDULED
         return task_id
+
+    def _compute_retry_delay(self, attempt: int) -> float:
+        """Compute jittered retry delay with exponential backoff."""
+        base_delay = self.RETRY_BASE_DELAY * (2 ** attempt)
+        jitter = base_delay * self.RETRY_JITTER_FACTOR * random.random()
+        return min(base_delay + jitter, self.RETRY_MAX_DELAY)
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        # Process expired scheduled tasks (promote to pending queue)
+        expired = []
+        for tid, (delay, task) in list(self._scheduled.items()):
+            if task.get("retry_at", 0) <= now:
+                expired.append(tid)
+
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            _, task = self._scheduled.pop(tid)
+            self._retry_scheduled.pop(tid, None)
             if task:
-                self.enqueue(task, queue)
+                # Guard: reject if task already reached terminal state
+                current_state = self._task_states.get(tid)
+                if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+                    # Skip - task already has terminal outcome
+                    continue
+                if queue not in self._queues:
+                    self._queues[queue] = PriorityQueue()
+                self._queues[queue].push(task, priority=task.get("priority", 0))
+                self._task_states[tid] = TaskState.PENDING
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
-                self._in_flight[task["id"]] = task
+                task_id = task["id"]
+                # Guard: reject if task already has terminal state
+                current_state = self._task_states.get(task_id)
+                if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+                    # Skip stale task - already processed
+                    return None
+                self._in_flight[task_id] = task
+                self._task_states[task_id] = TaskState.IN_FLIGHT
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        """Mark task as completed with state machine guard.
+        
+        Returns True if transition was made, False if task already terminal.
+        Records one durable terminal outcome.
+        """
+        # Guard: check if already terminal
+        current_state = self._task_states.get(task_id)
+        if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+            return False
+        
+        # Only remove from in_flight if present
+        if self._in_flight.pop(task_id, None) is not None:
+            self._task_states[task_id] = TaskState.COMPLETED
+            # Record durable terminal outcome
+            self._terminal_outcomes[task_id] = {
+                "status": "completed",
+                "completed_at": time.time(),
+            }
+            return True
+        return False
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
+        """Mark task as failed with jittered retry and state machine guard.
+        
+        Returns True if retry scheduled, False if terminal (max retries reached
+        or already terminal state).
+        
+        Guards against duplicate compensation scheduling by checking task state
+        before committing any state changes.
+        """
+        current_state = self._task_states.get(task_id)
+        # Guard: reject if already terminal - prevents duplicate compensation
+        if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+            return False
+        
         task = self._in_flight.pop(task_id, None)
+        if not task:
+            # Task may be in _scheduled (waiting for retry) - check there
+            if task_id in self._scheduled:
+                _, task = self._scheduled.pop(task_id)
+                self._retry_scheduled.pop(task_id, None)
+            else:
+                return False
+        
         if task:
             task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+            # Record this failure in terminal outcomes if exhausted
+            if task["retries"] >= self._max_retries:
+                self._task_states[task_id] = TaskState.FAILED
+                self._terminal_outcomes[task_id] = {
+                    "status": "failed",
+                    "retries": task["retries"],
+                    "failed_at": time.time(),
+                }
+                return False
+            
+            # Compute jittered delay and schedule retry
+            delay = self._compute_retry_delay(task["retries"])
+            task["retry_at"] = time.time() + delay
+            task["retry_delay"] = delay
+            
+            # Store in scheduled for deferred retry
+            self._scheduled[task_id] = (delay, task)
+            self._retry_scheduled[task_id] = time.time() + delay
+            self._task_states[task_id] = TaskState.SCHEDULED
+            return True
         return False
+
+    def cancel(self, task_id: str) -> bool:
+        """Cancel a task if not already terminal."""
+        current_state = self._task_states.get(task_id)
+        if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+            return False
+        
+        # Remove from all tracking structures
+        self._in_flight.pop(task_id, None)
+        self._scheduled.pop(task_id, None)
+        self._retry_scheduled.pop(task_id, None)
+        
+        self._task_states[task_id] = TaskState.CANCELLED
+        self._terminal_outcomes[task_id] = {
+            "status": "cancelled",
+            "cancelled_at": time.time(),
+        }
+        return True
+
+    def get_terminal_outcome(self, task_id: str) -> Optional[Dict]:
+        """Get the durable terminal outcome for a task."""
+        return self._terminal_outcomes.get(task_id)
+
+    def get_task_state(self, task_id: str) -> Optional[TaskState]:
+        """Get current task state."""
+        return self._task_states.get(task_id)
 
 # 2019-04-25T08:37:12 update
 
