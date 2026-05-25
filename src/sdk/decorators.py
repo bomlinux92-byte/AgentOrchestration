@@ -2,7 +2,31 @@
 
 import functools
 import asyncio
+import re
 from typing import Any, Callable, Dict, Optional
+
+from ..common.errors import VersionError
+
+
+# Semver regex pattern: major.minor.patch with optional pre-release and build metadata
+_SEMVER_PATTERN = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+    r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+)
+
+
+def _validate_version(version: str) -> None:
+    """Validate a version string against semver specification.
+
+    Args:
+        version: The version string to validate.
+
+    Raises:
+        VersionError: If the version string is not valid semver.
+    """
+    if not _SEMVER_PATTERN.match(version):
+        raise VersionError(version)
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
@@ -30,7 +54,18 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
 
 
 def agent(name: str, version: str = "1.0.0", description: str = ""):
-    """Decorator for marking a class as an agent definition."""
+    """Decorator for marking a class as an agent definition.
+
+    Args:
+        name: The agent name.
+        version: The agent version in semver format (e.g., "1.0.0").
+        description: A description of the agent.
+
+    Raises:
+        VersionError: If the version string is not valid semver.
+    """
+    _validate_version(version)
+
     def decorator(cls: type) -> type:
         cls.__agent_config__ = {
             "name": name,
