@@ -321,6 +321,61 @@ class TestDuplicateCompensationGuards:
         assert "retries" in outcome
         assert "failed_at" in outcome
 
+    def test_reclaim_abandoned_returns_stale_in_flight_tasks(self):
+        """Test that reclaim_abandoned returns tasks whose lease has expired."""
+        # Enqueue two tasks at same priority so order is deterministic (FIFO)
+        self.scheduler.enqueue({"type": "test1", "priority": 0}, priority=0)
+        self.scheduler.enqueue({"type": "test2", "priority": 0}, priority=0)
+        
+        task1 = asyncio.run(self.scheduler.dequeue())  # task1 first (FIFO)
+        task2 = asyncio.run(self.scheduler.dequeue())  # task2 second
+        
+        # Simulate: set task1's claimed_at far in the past to trigger reclaim
+        self.scheduler._in_flight[task1["id"]]["claimed_at"] = time.time() - self.scheduler._lease_timeout - 10
+        # task2 is recent, should not be reclaimed
+        self.scheduler._in_flight[task2["id"]]["claimed_at"] = time.time()
+        
+        # Reclaim should return 1 task (task1)
+        reclaimed = self.scheduler.reclaim_abandoned()
+        assert reclaimed == 1
+        
+        # task1 is now back in queue; dequeue gives it back (FIFO, same priority)
+        requeued = asyncio.run(self.scheduler.dequeue())
+        assert requeued["id"] == task1["id"]
+        assert requeued["retries"] == 0  # retries were reset
+
+    def test_reclaim_abandoned_skips_terminal_tasks(self):
+        """Test that reclaim does not steal completed/failed tasks."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        # Complete the task
+        self.scheduler.complete(task_id)
+        
+        # Manually set its in_flight entry to stale (edge case)
+        self.scheduler._in_flight[task_id] = {"task": task, "claimed_at": time.time() - 1000}
+        
+        # Reclaim should not return terminal tasks
+        reclaimed = self.scheduler.reclaim_abandoned()
+        assert reclaimed == 0
+
+    def test_reclaim_abandoned_resets_retries(self):
+        """Test that reclaimed tasks get their retry count reset."""
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+        task_id = task["id"]
+        
+        # Make task stale
+        self.scheduler._in_flight[task_id]["claimed_at"] = time.time() - self.scheduler._lease_timeout - 10
+        
+        # Reclaim
+        self.scheduler.reclaim_abandoned()
+        
+        # Re-dequeue and check retries are reset
+        requeued = asyncio.run(self.scheduler.dequeue())
+        assert requeued["retries"] == 0
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

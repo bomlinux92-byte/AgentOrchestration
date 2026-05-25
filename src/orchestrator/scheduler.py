@@ -53,7 +53,7 @@ class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, tuple] = {}  # task_id -> (delay, task)
-        self._in_flight: Dict[str, Dict] = {}
+        self._in_flight: Dict[str, Dict] = {}  # task_id -> {task, claimed_at}
         self._max_retries = 3
         # Track task state machine for idempotent transitions
         self._task_states: Dict[str, TaskState] = {}
@@ -61,6 +61,8 @@ class TaskScheduler:
         self._terminal_outcomes: Dict[str, Dict] = {}
         # Track pending retry scheduled times
         self._retry_scheduled: Dict[str, float] = {}
+        # Worker disconnect reclaim window (seconds)
+        self._lease_timeout: float = 60.0
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
@@ -121,7 +123,7 @@ class TaskScheduler:
                 if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
                     # Skip stale task - already processed
                     return None
-                self._in_flight[task_id] = task
+                self._in_flight[task_id] = {"task": task, "claimed_at": time.time()}
                 self._task_states[task_id] = TaskState.IN_FLIGHT
                 return task
         return None
@@ -138,7 +140,8 @@ class TaskScheduler:
             return False
         
         # Only remove from in_flight if present
-        if self._in_flight.pop(task_id, None) is not None:
+        entry = self._in_flight.pop(task_id, None)
+        if entry is not None:
             self._task_states[task_id] = TaskState.COMPLETED
             # Record durable terminal outcome
             self._terminal_outcomes[task_id] = {
@@ -162,14 +165,16 @@ class TaskScheduler:
         if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
             return False
         
-        task = self._in_flight.pop(task_id, None)
-        if not task:
+        entry = self._in_flight.pop(task_id, None)
+        if not entry:
             # Task may be in _scheduled (waiting for retry) - check there
             if task_id in self._scheduled:
                 _, task = self._scheduled.pop(task_id)
                 self._retry_scheduled.pop(task_id, None)
             else:
                 return False
+        else:
+            task = entry["task"]
         
         if task:
             task["retries"] += 1
@@ -212,6 +217,45 @@ class TaskScheduler:
             "cancelled_at": time.time(),
         }
         return True
+
+    def reclaim_abandoned(self, queue: str = "default") -> int:
+        """Reclaim in-flight tasks whose workers have disconnected.
+        
+        Moves tasks that have been in-flight beyond the lease timeout back
+        to the pending queue for re-assignment. Guards against reclaiming
+        tasks that have already reached terminal state.
+        
+        Returns the count of reclaimed tasks.
+        """
+        now = time.time()
+        reclaimed = 0
+        
+        # Collect stale in-flight entries
+        stale_ids = []
+        for task_id, entry in list(self._in_flight.items()):
+            claimed_at = entry.get("claimed_at", 0)
+            if now - claimed_at > self._lease_timeout:
+                stale_ids.append(task_id)
+        
+        for task_id in stale_ids:
+            current_state = self._task_states.get(task_id)
+            # Guard: only reclaim non-terminal tasks
+            if current_state in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):
+                continue
+            
+            entry = self._in_flight.pop(task_id, None)
+            if entry:
+                task = entry["task"]
+                # Reset retry count so task gets a full retry window
+                task["retries"] = 0
+                
+                if queue not in self._queues:
+                    self._queues[queue] = PriorityQueue()
+                self._queues[queue].push(task, priority=task.get("priority", 0))
+                self._task_states[task_id] = TaskState.PENDING
+                reclaimed += 1
+        
+        return reclaimed
 
     def get_terminal_outcome(self, task_id: str) -> Optional[Dict]:
         """Get the durable terminal outcome for a task."""
