@@ -1,4 +1,5 @@
 import pytest
+import os
 from src.common.config import Config
 
 
@@ -31,6 +32,42 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+
+class TestConfigEnvOverrides:
+    def test_boolean_false_is_not_truthy(self, monkeypatch):
+        """Regression test: AO_FEATURE_ENABLED=false must be bool False, not str 'false'."""
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+        config = Config()
+        val = config.get("feature.enabled")
+        assert val is False, f"Expected False, got {val!r}"
+
+    def test_boolean_true_coercion(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "true")
+        config = Config()
+        assert config.get("feature.enabled") is True
+
+    def test_boolean_uppercase(self, monkeypatch):
+        monkeypatch.setenv("AO_DEBUG", "FALSE")
+        config = Config()
+        assert config.get("debug") is False
+
+    def test_integer_coercion(self, monkeypatch):
+        monkeypatch.setenv("AO_PORT", "8080")
+        config = Config()
+        assert config.get("port") == 8080
+        assert isinstance(config.get("port"), int)
+
+    def test_float_coercion(self, monkeypatch):
+        monkeypatch.setenv("AO_RATE", "3.14")
+        config = Config()
+        assert config.get("rate") == 3.14
+        assert isinstance(config.get("rate"), float)
+
+    def test_string_passthrough(self, monkeypatch):
+        monkeypatch.setenv("AO_HOST", "localhost")
+        config = Config()
+        assert config.get("host") == "localhost"
 
 # 2019-02-01T18:58:35 update
 
