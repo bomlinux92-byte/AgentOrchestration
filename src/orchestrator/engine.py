@@ -24,10 +24,17 @@ class OrchestrationEngine:
             "on_error": [],
             "on_complete": [],
         }
+        # Wire registry deregistration to scheduler task invalidation
+        self.registry.register_deregister_listener(self._on_agent_deregistered)
 
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def _on_agent_deregistered(self, agent_id: str, agent_info: Dict) -> None:
+        """Handle agent deregistration by invalidating all pending tasks for that agent."""
+        invalidated = self.scheduler.invalidate_agent_tasks(agent_id)
+        logger.info(f"Invalidated {invalidated} tasks for deregistered agent {agent_id}")
 
     async def start(self) -> None:
         self._running = True

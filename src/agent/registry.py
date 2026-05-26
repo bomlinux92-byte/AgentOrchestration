@@ -21,6 +21,18 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._deregister_listeners: List[callable] = []
+
+    def register_deregister_listener(self, listener: callable) -> None:
+        """Register a callback to be invoked when an agent is deregistered.
+
+        The callback receives (agent_id, agent_info) upon deregistration.
+        """
+        self._deregister_listeners.append(listener)
+
+    def unregister_deregister_listener(self, listener: callable) -> None:
+        if listener in self._deregister_listeners:
+            self._deregister_listeners.remove(listener)
 
     def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
         agent_id = str(uuid.uuid4())
@@ -68,6 +80,9 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        # Notify deregistration listeners so schedulers can invalidate tasks
+        for listener in self._deregister_listeners:
+            listener(agent_id, agent)
         return True
 
     def count(self) -> int:

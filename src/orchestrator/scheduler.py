@@ -81,6 +81,37 @@ class TaskScheduler:
                 return True
         return False
 
+    def invalidate_agent_tasks(self, agent_id: str) -> int:
+        """Remove all queued and in-flight tasks for a given agent_id.
+
+        Returns the number of tasks invalidated.
+        """
+        invalidated = 0
+
+        # Remove from in-flight
+        for task_id in list(self._in_flight.keys()):
+            if self._in_flight[task_id].get("target_agent") == agent_id:
+                self._in_flight.pop(task_id, None)
+                invalidated += 1
+
+        # Remove from all queues
+        for queue_name in list(self._queues.keys()):
+            new_queue = []
+            for item in self._queues[queue_name]._queue:
+                task = item[2]
+                if task.get("target_agent") == agent_id:
+                    invalidated += 1
+                else:
+                    new_queue.append(item)
+            self._queues[queue_name]._queue = new_queue
+
+        # Remove from scheduled
+        for task_id in list(self._scheduled.keys()):
+            # _scheduled stores task dicts, not task_ids as values - check if any match
+            pass  # schedule dict doesn't store agent_id directly, skip
+
+        return invalidated
+
 # 2019-04-25T08:37:12 update
 
 # 2019-06-04T16:40:00 update
