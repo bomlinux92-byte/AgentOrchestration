@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
+from src.common.reducer_errors import get_error_store
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class OrchestrationEngine:
             "on_error": [],
             "on_complete": [],
         }
+        self._error_store = get_error_store()
 
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
@@ -69,6 +71,15 @@ class OrchestrationEngine:
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            # Persist reducer error separately for event processing diagnostics
+            self._error_store.record(
+                reducer_id=agent_id,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                context={"task_id": task_id},
+                task_id=task_id,
+                agent_id=agent_id,
+            )
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -83,6 +94,24 @@ class OrchestrationEngine:
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
         return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+
+    def get_reducer_errors(
+        self,
+        reducer_id: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Get reducer errors for diagnostics."""
+        errors = self._error_store.get_errors(
+            reducer_id=reducer_id,
+            limit=limit,
+            offset=offset,
+        )
+        return [e.to_dict() for e in errors]
+
+    def get_reducer_error_count(self, reducer_id: Optional[str] = None) -> int:
+        """Get count of reducer errors."""
+        return self._error_store.count(reducer_id=reducer_id)
 
 # 2019-04-24T14:55:39 update
 
