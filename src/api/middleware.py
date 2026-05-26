@@ -9,6 +9,19 @@ from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+BLOCKED_METHODS = {"TRACE", "TRACK"}
+
+
+class MethodMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        method = request.method.upper()
+        if method in BLOCKED_METHODS:
+            return Response(status_code=405, content="Method Not Allowed")
+        try:
+            return await call_next(request)
+        finally:
+            request.scope.clear()
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
